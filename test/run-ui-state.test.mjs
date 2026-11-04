@@ -1,0 +1,6 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';
+import {runAvailability} from '../public/dry-run.js';
+const state={busy:false,wetStarted:false,complete:true,plans:[{id:'plan',result:{rows:[{status:'planned'}]}}]};
+test('RUN enables after completed Dry Run; partial blocked rows do not prevent runnable rows',()=>{assert.equal(runAvailability(state).enabled,true);const mixed=structuredClone(state);mixed.plans[0].result.rows.push({status:'blocked'});assert.equal(runAvailability(mixed).enabled,true);assert.match(runAvailability(mixed).message,/1.*1/);});
+test('blocked, empty, incomplete and stale plans explain why RUN is disabled without loading indication',()=>{for(const s of [{...state,complete:false},{...state,plans:[]},{...state,plans:[{id:'plan',result:{rows:[{status:'blocked'}]}}]},{...state,plans:[{result:{rows:[{status:'planned'}]}}]},{...state,wetStarted:true}]){const r=runAvailability(s);assert.equal(r.enabled,false);assert.equal(r.loading,false);assert.ok(r.message);}});
+test('only an active wet run displays loading; dry completion releases button',()=>{assert.equal(runAvailability({...state,busy:true}).loading,false);assert.equal(runAvailability({...state,busy:true,wetStarted:true}).loading,true);assert.equal(runAvailability(state).enabled,true);});

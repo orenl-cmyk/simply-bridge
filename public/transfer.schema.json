@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SIMPLY BRIDGE transfer",
+  "type": "object",
+  "required": [
+    "meta",
+    "entities"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "packageId",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "1.0"
+        },
+        "packageId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        }
+      }
+    },
+    "entities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "meta",
+          "records"
+        ],
+        "properties": {
+          "meta": {
+            "type": "object",
+            "required": [
+              "dataName",
+              "key"
+            ],
+            "properties": {
+              "dataName": {
+                "type": "string"
+              },
+              "key": {
+                "type": "object"
+              }
+            }
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "matchKey",
+                "data"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "matchKey": {
+                  "type": [
+                    "string",
+                    "number"
+                  ]
+                },
+                "data": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

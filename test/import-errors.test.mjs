@@ -1,0 +1,9 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {buildErrorReport} from '../public/import-errors.js';
+test('error report preserves failed record, entity, mapping and validation details while excluding successes',()=>{
+ const record={id:'one',matchKey:'one',data:{g:[{role:'invalid',phone:'0501234567'}]}};
+ const report=buildErrorReport([{status:'succeeded'},{planId:'p',status:'failed',sourceId:'one',sourceRecord:record,sourceEntityMeta:{name:'משתמשים',dataName:'users'},targetEntity:'appUsers',error:{details:{column:[{field_data_name:'role',message:'invalid choice'}]}},mapping:[{sourceGroup:'g',targetGroup:'target'}]}]);
+ assert.equal(report.issues.length,1);assert.deepEqual(report.issues[0].sourceRecord,record);assert.equal(report.issues[0].entity.source.name,'משתמשים');assert.equal(report.issues[0].error.details.column[0].message,'invalid choice');assert.equal(report.summary.validationFailures,1);
+});
+test('legacy journal cannot be joined to an unrelated plan; unknown writes require inspection',()=>{
+ const r=buildErrorReport([{status:'unknown',planId:'old',sourceId:'one'}],[{id:'new',sourceEntity:{records:[{id:'one',data:{secret:'wrong record'}}]}}]);assert.equal(r.issues[0].recordAvailable,false);assert.equal(r.issues[0].requiresTargetCheck,true);assert.equal(r.summary.missingRecordContent,1);
+});

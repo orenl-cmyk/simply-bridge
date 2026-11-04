@@ -1,1 +1,42 @@
+name: Build offline Docker package
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, test and package Linux AMD64
+        env:
+          PLATFORM: linux/amd64
+        run: bash deploy/build-offline.sh
+      - name: Collect installation package
+        run: |
+          mkdir -p artifact
+          cp bridge-release-*/simply-bridge-offline.zip artifact/
+          cd artifact
+          sha256sum simply-bridge-offline.zip > simply-bridge-offline.zip.sha256
+      - name: Upload installation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: simply-bridge-linux-amd64-offline
+          path: artifact/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

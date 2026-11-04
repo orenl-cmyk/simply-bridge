@@ -1,0 +1,18 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';
+import {updatedField,exportParams,verifyWindow,dateRange,dryRunEntity,validateEntity} from '../sync.mjs';
+const schema={raw:{fields:[{field_type_name:'metadata-field',field_data_name:'modified',possible_values:'last_modified'}]},groups:[{id:'g',repeatable:false,fields:[{id:'title',type:'input-text'},{id:'external',type:'input-text'},{id:'relation',type:'select-from-entity'}]},{id:'rows',repeatable:true,fields:[{id:'note',type:'input-text'}]}]};
+const entity={meta:{dataName:'issues',name:'תקלות'},records:[{id:'source1',matchKey:'external1',data:{g:[{title:'hello'}]}}]};
+test('metadata filter is discovered by semantics and rejects ignored filters, absent dates and invalid windows',()=>{const range=dateRange({from:'2026-10-27T00:00:00Z',to:'2026-11-03T00:00:00Z'});assert.equal(updatedField(schema),'modified');assert.deepEqual(exportParams('issues',schema,range).filter,[['modified','>=',range.from],['modified','<',range.to]]);assert.throws(()=>exportParams('issues',{raw:{}},range));assert.throws(()=>dateRange({from:'bad',to:'bad'}));assert.throws(()=>verifyWindow({data:[{instance_data:{lastModified:range.to}}]},range));assert.throws(()=>verifyWindow({data:[{instance_data:{}}]},range));verifyWindow({data:[{instance_data:{lastModified:range.from}}]},range);});
+test('dry run searches only, plans update with target _id and create with external key, never sends write operations',async()=>{
+ const calls=[];const read=async(c,operation,params)=>{calls.push({operation,params});return {info:{total_count:1},data:[{instance_data:{_id:'target1',field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:'external1'}]]}]}}]};};
+ const args={connection:{baseUrl:'https://example.invalid'},entity,targetId:'issues',targetKey:{kind:'field',groupId:'g',fieldId:'external'},schema,read};
+ const r=await dryRunEntity(args);assert.equal(r.writeRequestsSent,0);assert.equal(r.rows[0].status,'planned');assert.deepEqual(r.rows[0].request.body.filter,[['_id','=','target1']]);assert.equal(r.rows[0].request.sent,false);assert.equal(calls.length,1);assert.equal(calls[0].operation,'instance_data');assert.deepEqual(calls[0].params.filter,[['external','=','external1']]);
+ const created=await dryRunEntity({...args,read:async()=>({data:[],info:{total_count:0}})});assert.equal(created.rows[0].action,'create');assert.equal(created.rows[0].request.body.form_data[0].data[0].external,'external1');assert.equal(created.rows[0].status,'planned');
+});
+test('dry run blocks ambiguous matches, ignored key filters, missing keys and unresolved relations/repeating groups',async()=>{
+ const args={connection:{baseUrl:'https://example.invalid'},entity,targetId:'issues',targetKey:{kind:'recordId'},schema};
+ const wrong=await dryRunEntity({...args,read:async()=>({data:[{instance_data:{_id:'wrong'}}],info:{total_count:1}})});assert.equal(wrong.rows[0].status,'blocked');
+ const duplicate=await dryRunEntity({...args,read:async()=>({data:[{instance_data:{_id:'source1'}},{instance_data:{_id:'source1'}}],info:{total_count:2}})});assert.equal(duplicate.rows[0].status,'blocked');
+ const complex=structuredClone(entity);complex.records[0].data.g[0].relation={instance_id:'other'};complex.records[0].data.rows=[{note:'row'}];const r=await dryRunEntity({...args,entity:complex,read:async()=>({data:[{instance_data:{_id:'source1'}}]})});assert.equal(r.rows[0].reasons.length,2);
+ const malformed=structuredClone(entity);malformed.records[0].matchKey=null;assert.throws(()=>validateEntity(malformed));
+});

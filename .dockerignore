@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!*.mjs
+!package.json
+!public/
+!public/**
+!deploy/
+!deploy/healthcheck.mjs

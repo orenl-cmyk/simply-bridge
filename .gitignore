@@ -1,0 +1,11 @@
+data/
+node_modules/
+work/
+artifact/
+bridge-release-*/
+.env
+*.vault.json
+*.tar
+*.zip
+*.log
+deploy/organization-ca.pem

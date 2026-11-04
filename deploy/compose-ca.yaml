@@ -1,0 +1,6 @@
+services:
+  bridge:
+    environment:
+      NODE_EXTRA_CA_CERTS: /app/certs/organization-ca.pem
+    volumes:
+      - ./organization-ca.pem:/app/certs/organization-ca.pem:ro

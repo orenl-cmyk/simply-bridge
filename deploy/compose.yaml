@@ -1,0 +1,23 @@
+name: simply-bridge
+services:
+  bridge:
+    image: ${BRIDGE_IMAGE:-simply-bridge:0.15.0}
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-4318}:4318"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "4318"
+      PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+      DATA_DIR: /app/data
+    volumes:
+      - bridge_data:/app/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  bridge_data:
+    name: ${DATA_VOLUME:-simply-bridge-data}
