@@ -8,4 +8,8 @@ bridge-release-*/
 *.tar
 *.zip
 *.log
+windows/bin/
+windows/obj/
+windows/installer-output/
+build/
 deploy/organization-ca.pem

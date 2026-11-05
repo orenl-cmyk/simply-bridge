@@ -1,0 +1,111 @@
+name: Build Windows packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "windows/**"
+      - "public/**"
+      - "*.mjs"
+      - "package.json"
+      - ".github/workflows/windows-package.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      APP_VERSION: "0.15.0"
+      NODE_VERSION: "22.11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish Windows launcher
+        shell: pwsh
+        run: dotnet publish windows/SimplyBridge.Launcher.csproj -c Release -r win-x64 --self-contained true -o build/launcher
+
+      - name: Download and verify Node.js runtime
+        shell: pwsh
+        run: |
+          $archive = "node-v$env:NODE_VERSION-win-x64.zip"
+          Invoke-WebRequest "https://nodejs.org/dist/v$env:NODE_VERSION/$archive" -OutFile $archive
+          Invoke-WebRequest "https://nodejs.org/dist/v$env:NODE_VERSION/SHASUMS256.txt" -OutFile SHASUMS256.txt
+          $expected = ((Select-String -Path SHASUMS256.txt -Pattern "  $([regex]::Escape($archive))$").Line -split '\s+')[0]
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $expected -or $actual -ne $expected.ToLowerInvariant()) { throw "Node.js checksum mismatch" }
+          Expand-Archive $archive -DestinationPath build/node
+
+      - name: Assemble application directory
+        shell: pwsh
+        run: |
+          $stage = "build/windows-stage"
+          New-Item -ItemType Directory -Force "$stage/runtime", "$stage/app/public" | Out-Null
+          Copy-Item build/launcher/SimplyBridge.exe "$stage/SimplyBridge.exe"
+          Copy-Item "build/node/node-v$env:NODE_VERSION-win-x64/node.exe" "$stage/runtime/node.exe"
+          Copy-Item "build/node/node-v$env:NODE_VERSION-win-x64/LICENSE" "$stage/runtime/NODE-LICENSE.txt"
+          Copy-Item *.mjs "$stage/app/"
+          Copy-Item package.json "$stage/app/package.json"
+          Copy-Item public/* "$stage/app/public/" -Recurse
+          Copy-Item windows/README-WINDOWS.txt "$stage/README.txt"
+
+      - name: Test bundled server
+        shell: pwsh
+        run: |
+          $stage = (Resolve-Path build/windows-stage).Path
+          $env:HOST = "127.0.0.1"
+          $env:PORT = "4387"
+          $env:PUBLIC_URL = "http://127.0.0.1:4387/"
+          $env:DATA_DIR = Join-Path $env:RUNNER_TEMP "simply-bridge-smoke"
+          $process = Start-Process "$stage/runtime/node.exe" -ArgumentList "$stage/app/server.mjs" -WorkingDirectory "$stage/app" -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            1..40 | ForEach-Object {
+              if (-not $ready) {
+                try { $ready = (Invoke-WebRequest $env:PUBLIC_URL -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { Start-Sleep -Milliseconds 250 }
+              }
+            }
+            if (-not $ready) { throw "Bundled server did not become ready" }
+          } finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
+
+      - name: Run automated tests
+        shell: pwsh
+        run: |
+          $tests = Get-ChildItem test/*.test.mjs | ForEach-Object { $_.FullName }
+          & build/windows-stage/runtime/node.exe --test --test-concurrency=1 $tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: Compress-Archive build/windows-stage/* "SimplyBridge-Portable-v$env:APP_VERSION-win-x64.zip" -CompressionLevel Optimal
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" windows/SimplyBridge.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item windows/installer-output/*.exe .
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem SimplyBridge-*.exe,SimplyBridge-*.zip | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimplyBridge-v0.15.0-Windows-x64
+          path: |
+            SimplyBridge-Setup-v0.15.0-win-x64.exe
+            SimplyBridge-Portable-v0.15.0-win-x64.zip
+            SHA256SUMS.txt
+          retention-days: 7
+          if-no-files-found: error
