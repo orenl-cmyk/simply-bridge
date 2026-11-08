@@ -31,7 +31,7 @@ bash install-offline.sh
 PUBLIC_URL=http://10.20.30.40:4318/
 HOST_PORT=4318
 BIND_IP=0.0.0.0
-BRIDGE_IMAGE=simply-bridge:0.15.0
+BRIDGE_IMAGE=simply-bridge:0.16.0
 DATA_VOLUME=simply-bridge-data
 ```
 

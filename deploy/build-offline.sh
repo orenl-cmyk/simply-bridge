@@ -4,7 +4,7 @@ cd -- "$(dirname -- "$0")/.."
 for cmd in docker zip sha256sum; do command -v "$cmd" >/dev/null || { echo "Required: $cmd" >&2; exit 1; }; done
 docker info >/dev/null
 platform="${PLATFORM:-linux/amd64}"
-image="simply-bridge:0.15.0"
+image="simply-bridge:0.16.0"
 release_dir="$(mktemp -d "$PWD/bridge-release-XXXXXX")"
 docker build --platform "$platform" --build-arg "NODE_IMAGE=${NODE_IMAGE:-node:22-bookworm-slim}" -t "$image" .
 # Tests run inside the image runtime, without internet and without user data.

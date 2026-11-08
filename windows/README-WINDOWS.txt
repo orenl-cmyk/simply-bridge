@@ -1,8 +1,8 @@
-SIMPLY BRIDGE 0.15.0 - Windows x64
+SIMPLY BRIDGE 0.16.0 - Windows x64
 =================================
 
 Installer:
-  Run SimplyBridge-Setup-v0.15.0-win-x64.exe and then open SIMPLY BRIDGE
+  Run SimplyBridge-Setup-v0.16.0-win-x64.exe and then open SIMPLY BRIDGE
   from the Start menu. Administrator rights are not required.
 
 Portable ZIP:

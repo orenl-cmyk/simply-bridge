@@ -19,7 +19,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     env:
-      APP_VERSION: "0.15.0"
+      APP_VERSION: "0.16.0"
       NODE_VERSION: "22.11.0"
     steps:
       - uses: actions/checkout@v4
@@ -99,13 +99,22 @@ jobs:
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
           } | Set-Content SHA256SUMS.txt -Encoding ascii
 
-      - name: Upload Windows packages
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: SimplyBridge-v0.15.0-Windows-x64
+          name: SimplyBridge-Setup-v0.16.0-Windows-x64
           path: |
-            SimplyBridge-Setup-v0.15.0-win-x64.exe
-            SimplyBridge-Portable-v0.15.0-win-x64.zip
+            SimplyBridge-Setup-v0.16.0-win-x64.exe
             SHA256SUMS.txt
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload Windows portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimplyBridge-Portable-v0.16.0-Windows-x64
+          path: |
+            SimplyBridge-Portable-v0.16.0-win-x64.zip
+            SHA256SUMS.txt
+          retention-days: 30
           if-no-files-found: error

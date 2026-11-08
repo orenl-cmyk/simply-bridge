@@ -1,4 +1,4 @@
-#define AppVersion "0.15.0"
+#define AppVersion "0.16.0"
 #define StageDir "..\\build\\windows-stage"
 
 [Setup]
