@@ -9,7 +9,7 @@ test('exclude users and user groups by identity anywhere in the list, before val
 });
 test('debug reports preserve network causes and redact credentials in reflected responses',async()=>{
  const secret='TEST-SECRET-12345',username='private@example.invalid';let debug;
- const server=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:'failed '+secret+' '+username,api_secret:secret,Authorization:'Bearer hidden-token',nested:{password:'also-hidden'}}));});
+ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:'failed '+secret+' '+username,api_secret:secret,Authorization:'Bearer hidden-token',nested:{username:'admin',password:'also-hidden'}}));});
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
  const port=server.address().port,c={baseUrl:`http://127.0.0.1:${port}`,username,secret};
  try{await assert.rejects(readOrigami(c,'entities_list',{},d=>debug=d));assert.equal(debug.response.status,200);assert.equal(debug.failureStage,'api-result');assert.equal(debug.request.method,'POST');assert.equal(debug.request.body.api_secret,'[REDACTED]');const report=JSON.stringify(debug);for(const s of [secret,username,'hidden-token','also-hidden'])assert.equal(report.includes(s),false);assert.ok(report.includes('[REDACTED]'));}finally{await new Promise(r=>server.close(r));}

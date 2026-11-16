@@ -9,10 +9,19 @@ test('dry run searches only, plans update with target _id and create with extern
  const r=await dryRunEntity(args);assert.equal(r.writeRequestsSent,0);assert.equal(r.rows[0].status,'planned');assert.deepEqual(r.rows[0].request.body.filter,[['_id','=','target1']]);assert.equal(r.rows[0].request.sent,false);assert.equal(calls.length,1);assert.equal(calls[0].operation,'instance_data');assert.deepEqual(calls[0].params.filter,[['external','=','external1']]);
  const created=await dryRunEntity({...args,read:async()=>({data:[],info:{total_count:0}})});assert.equal(created.rows[0].action,'create');assert.equal(created.rows[0].request.body.form_data[0].data[0].external,'external1');assert.equal(created.rows[0].status,'planned');
 });
-test('dry run blocks ambiguous matches, ignored key filters, missing keys and unresolved relations/repeating groups',async()=>{
+test('dry run reports completed records only after each record was checked',async()=>{const input=structuredClone(entity);input.records.push({...structuredClone(input.records[0]),id:'source2',matchKey:'external2'});const progress=[];await dryRunEntity({connection:{baseUrl:'https://example.invalid'},entity:input,targetId:'issues',targetKey:{kind:'field',groupId:'g',fieldId:'external'},schema,read:async()=>({data:[],info:{total_count:0}}),onProgress:value=>progress.push(value)});assert.deepEqual(progress,[{processed:1,total:2},{processed:2,total:2}]);});
+test('dry run blocks ambiguous matches, ignored key filters and unresolved relations',async()=>{
  const args={connection:{baseUrl:'https://example.invalid'},entity,targetId:'issues',targetKey:{kind:'recordId'},schema};
  const wrong=await dryRunEntity({...args,read:async()=>({data:[{instance_data:{_id:'wrong'}}],info:{total_count:1}})});assert.equal(wrong.rows[0].status,'blocked');
  const duplicate=await dryRunEntity({...args,read:async()=>({data:[{instance_data:{_id:'source1'}},{instance_data:{_id:'source1'}}],info:{total_count:2}})});assert.equal(duplicate.rows[0].status,'blocked');
- const complex=structuredClone(entity);complex.records[0].data.g[0].relation={instance_id:'other'};complex.records[0].data.rows=[{note:'row'}];const r=await dryRunEntity({...args,entity:complex,read:async()=>({data:[{instance_data:{_id:'source1'}}]})});assert.equal(r.rows[0].reasons.length,2);
+ const complex=structuredClone(entity);complex.records[0].data.g[0].relation={instance_id:'other'};complex.records[0].data.rows=[{note:'row'}];const r=await dryRunEntity({...args,entity:complex,read:async()=>({data:[{instance_data:{_id:'external1'}}]})});assert.equal(r.rows[0].reasons.length,1);assert.equal(r.rows[0].requests.at(-1).operation,'add_group_repetition');
  const malformed=structuredClone(entity);malformed.records[0].matchKey=null;assert.throws(()=>validateEntity(malformed));
 });
+test('dates use text and repeat groups update an existing index then add missing rows',async()=>{
+ const extended=structuredClone(schema);extended.groups[0].fields.push({id:'date',name:'Date',type:'datetime'});
+ const input=structuredClone(entity);input.records[0].data.g[0].date={timestamp:1770000000,text:'02/02/2026'};input.records[0].data.rows=[{note:'first'},{note:'second'}];input.records[0].groupIndexes={rows:[2,5]};
+ const target={_id:'target1',field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:'external1',group_index:'0'}]]},{field_group_data:{group_data_name:'rows'},fields_data:[[{field_data_name:'note',value:'old',group_index:'2'}]]}]};
+ const result=await dryRunEntity({connection:{baseUrl:'https://example.invalid'},entity:input,targetId:'issues',targetKey:{kind:'field',groupId:'g',fieldId:'external'},schema:extended,read:async()=>({data:[{instance_data:target}],info:{total_count:1}})});
+ const row=result.rows[0];assert.equal(row.status,'planned');assert.equal(row.requests.length,2);assert.equal(row.requests[0].operation,'update_instance_fields');assert.deepEqual(row.requests[0].body.field.find(x=>x[0]==='date'),['date','02/02/2026',0]);assert.deepEqual(row.requests[0].body.field.find(x=>x[0]==='note'),['note','first',2]);assert.equal(row.requests[1].operation,'add_group_repetition');assert.deepEqual({...row.requests[1].body.group_data},{note:'second'});assert.equal(row.requests[1].sourceGroupIndex,5);
+});
+

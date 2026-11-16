@@ -1,0 +1,339 @@
+SIMPLY BRIDGE — PODMAN UPDATE GUIDE
+====================================
+
+PACKAGE CONTENTS
+----------------
+- simply-bridge-update.tar — the application image.
+- UPDATE-PODMAN.txt — this guide.
+
+Run ONE command at a time. Read the SUCCESS CHECK before continuing.
+Never run: podman compose down -v
+The -v option can delete the application data volume.
+
+============================================================
+STEP 1 — EXTRACT THE ZIP ON THE WINDOWS COMPUTER
+============================================================
+
+Extract simply-bridge-update.zip into a regular folder.
+The extracted folder must contain:
+
+- simply-bridge-update.tar
+- UPDATE-PODMAN.txt
+
+[1.1] Open CMD in the extracted folder.
+
+[1.2] Calculate the local SHA256:
+
+certutil -hashfile simply-bridge-update.tar SHA256
+
+SUCCESS CHECK:
+- A long SHA256 value is displayed.
+- The final line says: CertUtil: -hashfile command completed successfully.
+- Save the SHA256 value. You will compare it with the server copy.
+
+ALTERNATIVE — PowerShell:
+
+Get-FileHash .\simply-bridge-update.tar -Algorithm SHA256
+
+SUCCESS CHECK:
+- Algorithm is SHA256.
+- A Hash value is displayed.
+
+============================================================
+STEP 2 — UPLOAD THE FILE WITHOUT OVERWRITING THE OLD FILE YET
+============================================================
+
+[2.1] From Windows CMD, upload with a temporary name:
+
+scp simply-bridge-update.tar root@SERVER_IP:/root/simply-bridge-update.new.tar
+
+Replace SERVER_IP with the Linux server address.
+
+SUCCESS CHECK:
+- Upload progress reaches 100%.
+- CMD returns without an error.
+- The old simply-bridge-update.tar remains untouched if this upload fails.
+
+ALTERNATIVE:
+- Use WinSCP.
+- Upload into /root/.
+- Set the remote filename to simply-bridge-update.new.tar.
+
+[2.2] Connect to the server:
+
+ssh root@SERVER_IP
+
+SUCCESS CHECK:
+- The prompt changes to the Linux server prompt.
+
+ALTERNATIVE:
+- Use PuTTY or the WinSCP terminal.
+
+============================================================
+STEP 3 — VERIFY THE UPLOADED FILE
+============================================================
+
+[3.1] Calculate SHA256 on the server:
+
+sha256sum /root/simply-bridge-update.new.tar
+
+SUCCESS CHECK:
+- The SHA256 is exactly the same as the value from STEP 1.
+- Do not continue if the values differ.
+
+ALTERNATIVE:
+
+openssl dgst -sha256 /root/simply-bridge-update.new.tar
+
+[3.2] After the hashes match, replace the previous transfer file:
+
+mv -f /root/simply-bridge-update.new.tar /root/simply-bridge-update.tar
+
+SUCCESS CHECK:
+- A successful mv normally prints nothing.
+
+[3.3] Verify the resulting file:
+
+ls -lh /root/simply-bridge-update.tar
+
+SUCCESS CHECK:
+- The file is listed.
+- Its size is not zero.
+- Its modification date is current.
+
+NOTE:
+Overwriting this TAR does not remove older images already loaded in Podman.
+Rollback uses versioned Podman image tags, not this transfer filename.
+
+============================================================
+STEP 4 — ONE-TIME SETUP WHEN UPGRADING FROM VERSION 0.16
+============================================================
+
+Run this section only once. Future updates start at STEP 5.
+
+[4.1] Enter the existing deployment directory:
+
+cd ~/simply-bridge
+
+[4.2] Verify the directory:
+
+pwd
+
+SUCCESS CHECK:
+- The displayed path ends with /simply-bridge.
+
+[4.3] Back up the current environment file:
+
+cp .env .env.backup-before-current
+
+[4.4] Verify the backup:
+
+ls -l .env .env.backup-before-current
+
+SUCCESS CHECK:
+- Both files are listed.
+
+[4.5] Display the current image setting:
+
+grep '^BRIDGE_IMAGE=' .env
+
+EXPECTED OLD VALUE:
+BRIDGE_IMAGE=simply-bridge:0.16.0
+
+[4.6] Change the image setting to the permanent update tag:
+
+sed -i 's/^BRIDGE_IMAGE=.*/BRIDGE_IMAGE=simply-bridge:current/' .env
+
+SUCCESS CHECK:
+- A successful sed normally prints nothing.
+
+[4.7] Verify the new setting:
+
+grep '^BRIDGE_IMAGE=' .env
+
+REQUIRED RESULT:
+BRIDGE_IMAGE=simply-bridge:current
+
+ALTERNATIVE IF sed IS NOT AVAILABLE:
+- Run: nano .env
+- Or run: vi .env
+- Change only the BRIDGE_IMAGE line.
+- Save the file, then repeat STEP 4.7.
+
+============================================================
+STEP 5 — LOAD THE UPDATE INTO PODMAN
+============================================================
+
+This step is required for every update.
+
+[5.1] Load the image:
+
+podman load -i /root/simply-bridge-update.tar
+
+SUCCESS CHECK:
+- Podman reports loaded images.
+- The output includes simply-bridge:current.
+- The output also includes a numbered tag such as simply-bridge:0.17.0.
+
+[5.2] Display all available SIMPLY BRIDGE images:
+
+podman images simply-bridge
+
+SUCCESS CHECK:
+- The new numbered version is displayed.
+- The current tag is displayed.
+- Previous numbered versions remain available for rollback.
+
+IMPORTANT:
+- Do not run podman image prune -a if you want to keep rollback versions.
+
+============================================================
+STEP 6 — DETECT THE AVAILABLE COMPOSE COMMAND
+============================================================
+
+[6.1] Try the integrated command:
+
+podman compose version
+
+SUCCESS CHECK:
+- A Compose provider version is displayed.
+- If successful, use podman compose in the following steps.
+
+[6.2] If STEP 6.1 fails, try:
+
+podman-compose --version
+
+SUCCESS CHECK:
+- A podman-compose version is displayed.
+- If successful, use podman-compose in the following steps.
+
+If neither command exists, stop. A Podman Compose provider must be installed before updating the existing Compose deployment.
+
+============================================================
+STEP 7 — START THE NEW VERSION
+============================================================
+
+No manual stop or down command is required.
+
+[7.1] If podman compose is available:
+
+podman compose up -d --no-build --force-recreate
+
+ALTERNATIVE — if only podman-compose is available:
+
+podman-compose up -d --no-build --force-recreate
+
+SUCCESS CHECK:
+- The bridge service is recreated.
+- The command completes without an error.
+- The service is reported as started or running.
+
+============================================================
+STEP 8 — VERIFY THE UPDATE
+============================================================
+
+[8.1] If podman compose is available:
+
+podman compose ps
+
+ALTERNATIVE:
+
+podman-compose ps
+
+SUCCESS CHECK:
+- The bridge service is running.
+- If health status is displayed, wait until it is healthy.
+
+[8.2] If podman compose is available:
+
+podman compose logs --tail 100 bridge
+
+ALTERNATIVE:
+
+podman-compose logs --tail 100 bridge
+
+SUCCESS CHECK:
+- The server starts normally.
+- There is no repeated restart loop.
+- There is no PUBLIC_URL error.
+- There is no /app/data permission error.
+
+[8.3] Open the existing SIMPLY BRIDGE address in the browser and test login.
+
+[8.4] Optional — remove only the uploaded transfer file after validation:
+
+rm -f /root/simply-bridge-update.tar
+
+NOTE:
+Removing the TAR does not remove images already loaded into Podman.
+Keep the original ZIP on the Windows computer.
+
+============================================================
+STEP 9 — STANDARD PROCESS FOR ALL FUTURE UPDATES
+============================================================
+
+For future releases, perform only these steps:
+
+1. STEP 1 — Extract and calculate SHA256.
+2. STEP 2 — Upload as simply-bridge-update.new.tar.
+3. STEP 3 — Compare SHA256 and rename with mv -f.
+4. STEP 5 — Run podman load.
+5. STEP 7 — Run Compose with --force-recreate.
+6. STEP 8 — Check status, logs and browser access.
+
+Do not edit .env again while it contains:
+BRIDGE_IMAGE=simply-bridge:current
+
+============================================================
+STEP 10 — ROLLBACK
+============================================================
+
+The TAR may be overwritten safely because Podman retains numbered image tags.
+
+[10.1] Display available versions:
+
+podman images simply-bridge
+
+SUCCESS CHECK:
+- Identify the previous numbered version, for example 0.17.0.
+- Stop if the required version is not listed.
+
+[10.2] Enter the deployment directory:
+
+cd ~/simply-bridge
+
+[10.3] Back up .env before changing it:
+
+cp .env .env.before-rollback
+
+[10.4] Select the previous version. Example for 0.17.0:
+
+sed -i 's/^BRIDGE_IMAGE=.*/BRIDGE_IMAGE=simply-bridge:0.17.0/' .env
+
+Replace 0.17.0 with the actual version selected in STEP 10.1.
+
+[10.5] Verify the selected version:
+
+grep '^BRIDGE_IMAGE=' .env
+
+SUCCESS CHECK:
+- The exact numbered version is displayed.
+
+[10.6] If podman compose is available:
+
+podman compose up -d --no-build --force-recreate
+
+ALTERNATIVE:
+
+podman-compose up -d --no-build --force-recreate
+
+[10.7] Repeat STEP 8 to verify status and logs.
+
+[10.8] After a fixed update TAR is available, restore the normal update setting:
+
+sed -i 's/^BRIDGE_IMAGE=.*/BRIDGE_IMAGE=simply-bridge:current/' .env
+
+[10.9] Load the fixed TAR using STEP 5, then start it using STEP 7.
+
+ROLLBACK ALTERNATIVE:
+If the required version is no longer listed by podman images, upload the saved ZIP/TAR for that version and run podman load before retrying STEP 10.

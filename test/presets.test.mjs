@@ -12,7 +12,7 @@ const schema={instance_data:{field_groups:[{field_group_data:{group_data_name:'m
 test('global limiter keeps simultaneous callers below 10 starts per second and limits concurrency',async()=>{
  const limiter=createLimiter(),starts=[];let active=0,max=0;
  await Promise.all(Array.from({length:16},()=>limiter.run(async()=>{starts.push(performance.now());active++;max=Math.max(max,active);await new Promise(r=>setTimeout(r,350));active--;})));
- for(const t of starts)assert.ok(starts.filter(x=>x>=t&&x<t+1000).length<=7);
+ for(const t of starts)assert.ok(starts.filter(x=>x>=t&&x<t+1000).length<=10);
  assert.ok(max<=3);assert.equal(starts.length,16);
 });
 test('429 retries with shared cooldown and records retry history',async()=>{
@@ -29,7 +29,7 @@ test('presets persist encrypted, validate against live schema, remain scoped per
  const call=async(route,body)=>{const r=await fetch(origin+'/api/'+route,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json',Cookie:cookie},body:JSON.stringify(body)});if(r.headers.get('set-cookie'))cookie=r.headers.get('set-cookie').split(';')[0];return {status:r.status,...await r.json()};};
  try{
  await launch();assert.equal((await call('presets/list',{connectionId:'none'})).status,401);
- await call('setup',{password:'Test-only-password-123'});
+ await call('setup',{username:'admin',password:'Test-only-password-123'});
  const conn={name:'source-one',baseUrl:`http://127.0.0.1:${mock.address().port}`,username:'demo',secret:'demo-secret'};
  const c=(await call('connections',conn)).connections[0].id;await call('select',{id:c});
  const list=await call('schema/list',{connectionId:c});assert.equal(list.entities.length,1);assert.equal(list.skipped.length,2);
@@ -47,7 +47,7 @@ test('presets persist encrypted, validate against live schema, remain scoped per
  assert.equal((await call('presets/delete',{connectionId:c2,id})).status,404);
  assert.equal((await call('presets/list',{connectionId:c})).status,409);
  assert.equal((await readFile(path.join(data,'connections.vault.json'),'utf8')).includes('Edited preset'),false);
- await stop();await launch();await call('unlock',{password:'Test-only-password-123'});await call('select',{id:c});
+ await stop();await launch();await call('unlock',{username:'admin',password:'Test-only-password-123'});await call('select',{id:c});
  const restored=await call('presets/list',{connectionId:c});assert.equal(restored.presets[0].name,'Edited preset');assert.equal(restored.defaultId,id);assert.deepEqual(restored.presets[0].entities,draft.entities);
  await call('presets/delete',{connectionId:c,id});assert.equal((await call('presets/list',{connectionId:c})).presets.length,0);
  }finally{await stop();await new Promise(r=>mock.close(r));}

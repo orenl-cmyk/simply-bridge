@@ -1,3 +1,6 @@
+# Deny by default. Only production source files explicitly listed below may
+# enter the build context; data/, vaults, .env files, tests and work artifacts
+# therefore remain outside both the context and the image.
 **
 !Dockerfile
 !*.mjs

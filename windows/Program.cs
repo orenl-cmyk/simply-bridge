@@ -7,7 +7,7 @@ namespace SimplyBridge;
 
 internal static class Program
 {
-    private const string Version = "0.16.0";
+    private const string Version = "0.16.4";
     private static readonly string StateDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimplyBridge");
     private static readonly string EndpointFile = Path.Combine(StateDirectory, "endpoint.json");
@@ -200,3 +200,4 @@ internal static class Program
         try { logWriter?.WriteLine($"[{DateTimeOffset.Now:O}] {message}"); } catch { }
     }
 }
+

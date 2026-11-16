@@ -30,8 +30,11 @@ jobs:
         run: |
           mkdir -p artifact
           cp bridge-release-*/simply-bridge-offline.zip artifact/
+          cp bridge-release-*/simply-bridge-update.zip artifact/
+          cp bridge-release-*/simply-bridge-update.tar artifact/
           cd artifact
           sha256sum simply-bridge-offline.zip > simply-bridge-offline.zip.sha256
+          sha256sum simply-bridge-update.tar > simply-bridge-update.tar.sha256
       - name: Upload installation package
         uses: actions/upload-artifact@v4
         with:

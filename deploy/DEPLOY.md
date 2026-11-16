@@ -31,7 +31,7 @@ bash install-offline.sh
 PUBLIC_URL=http://10.20.30.40:4318/
 HOST_PORT=4318
 BIND_IP=0.0.0.0
-BRIDGE_IMAGE=simply-bridge:0.16.0
+BRIDGE_IMAGE=simply-bridge:current
 DATA_VOLUME=simply-bridge-data
 ```
 
@@ -70,3 +70,22 @@ docker compose -f compose.yaml -f compose-ca.yaml up -d --pull never --no-build
 למרות שהפריסה המתוכננת היא שרת ופורט ישירים, ניתן להגדיר PUBLIC_URL=https://server/bridge/ בהמשך. ה־proxy צריך להעביר את הנתיב /bridge/ ללא הסרה ולשמור את Host הציבורי. היישום אינו סומך על X-Forwarded-Host. אם ה־proxy באותו שרת, ניתן להגדיר BIND_IP=127.0.0.1. נדרשת התאמת מגבלת גוף הבקשה ל־10MB וזמן המתנה מספיק ל־Dry Run.
 
 אין כיום שירות אוטומציה ברקע; גרסה זו מפעילה את ה־GUI ואת מנגנון ההעברה הקיים. תהליכים אוטומטיים יתווספו בגרסאות נפרדות.
+
+## עדכון בקובץ יחיד עם Podman
+
+הגדירו פעם אחת בקובץ `.env` הקיים:
+
+```dotenv
+BRIDGE_IMAGE=simply-bridge:current
+```
+
+בכל גרסה חדשה העבירו לשרת רק את `simply-bridge-update.tar`, ואז מתוך התיקייה שבה נמצאים קובצי ה־Compose וה־`.env` הקיימים:
+
+```bash
+podman load -i /path/to/simply-bridge-update.tar
+podman compose up -d --no-build --force-recreate
+podman compose ps
+podman compose logs --tail 100 bridge
+```
+
+אין לבצע `down -v`. טעינת ה־image אינה משנה את `.env`, את קובצי ה־Compose, את תעודת הארגון או את ה־volume. ה־TAR כולל גם תג ממוספר לצורך חזרה לגרסה קודמת.

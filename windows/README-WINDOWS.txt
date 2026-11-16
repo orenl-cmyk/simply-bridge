@@ -1,8 +1,8 @@
-SIMPLY BRIDGE 0.16.0 - Windows x64
+SIMPLY BRIDGE 0.16.4 - Windows x64
 =================================
 
 Installer:
-  Run SimplyBridge-Setup-v0.16.0-win-x64.exe and then open SIMPLY BRIDGE
+  Run SimplyBridge-Setup-v0.16.4-win-x64.exe and then open SIMPLY BRIDGE
   from the Start menu. Administrator rights are not required.
 
 Portable ZIP:
@@ -21,3 +21,4 @@ configured SIMPLY server addresses over the network.
 
 This build is unsigned. Windows or organizational policy may display a warning
 or block it until it is approved or signed with the organization's certificate.
+

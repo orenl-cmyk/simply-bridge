@@ -1,13 +1,14 @@
 {
   "name": "simply-bridge",
-  "version": "0.16.0",
+  "version": "0.22.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --preserve-symlinks --preserve-symlinks-main --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=22"
   }
 }
+

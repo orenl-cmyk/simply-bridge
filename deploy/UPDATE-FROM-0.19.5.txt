@@ -1,0 +1,171 @@
+SIMPLY BRIDGE 0.21.3 - PODMAN UPDATE FROM 0.19.5 OR NEWER
+===========================================================
+
+This package replaces only the container image. It does not replace .env,
+compose.yaml, compose-ca.yaml, Nginx configuration, or the named data volume.
+Run one command at a time and verify the result before continuing.
+
+Files in this ZIP
+-----------------
+- simply-bridge-update.tar  : Podman/Docker image for Linux AMD64
+- SHA256SUMS.txt            : checksum of the TAR inside the ZIP
+- UPDATE-FROM-0.19.5.txt    : this guide
+
+1. Upload the ZIP from Windows CMD
+----------------------------------
+
+scp "C:\path\to\simply-bridge-update-0.21.3.zip" root@YOUR_SERVER:~/simply-bridge/
+
+Expected: the transfer reaches 100%.
+
+2. Open the installed directory on the Linux server
+----------------------------------------------------
+
+cd ~/simply-bridge
+
+Verify:
+
+pwd
+
+Expected: a path ending in /simply-bridge.
+
+3. Confirm that the current version remains available for rollback
+-------------------------------------------------------------------
+
+podman images localhost/simply-bridge
+
+Expected: the current tag, normally 0.19.5, is listed. Do not delete it.
+
+4. Extract this update into its own folder
+------------------------------------------
+
+mkdir -p updates/0.21.3
+
+unzip -o simply-bridge-update-0.21.3.zip -d updates/0.21.3
+
+Expected: three files are extracted. If unzip is unavailable, extract the ZIP
+on Windows and upload its three files into ~/simply-bridge/updates/0.21.3/.
+
+5. Verify the image archive
+---------------------------
+
+cd ~/simply-bridge/updates/0.21.3
+
+sha256sum -c SHA256SUMS.txt
+
+Expected: simply-bridge-update.tar: OK
+
+Alternative if sha256sum is unavailable:
+
+openssl dgst -sha256 simply-bridge-update.tar
+
+Compare the printed value with SHA256SUMS.txt.
+
+6. Load the new image without overwriting the old version tag
+--------------------------------------------------------------
+
+podman load -i simply-bridge-update.tar
+
+Expected: localhost/simply-bridge:0.21.3 is loaded.
+
+Verify:
+
+podman images localhost/simply-bridge
+
+Expected: both 0.21.3 and the previous version are listed.
+
+7. Back up the installed environment file
+-----------------------------------------
+
+cd ~/simply-bridge
+
+cp -p .env .env.before-0.21.3
+
+Expected: no output.
+
+Verify the backup:
+
+ls -l .env .env.before-0.21.3
+
+Expected: both files are listed.
+
+8. Change only the image tag
+----------------------------
+
+vi .env
+
+Change only the BRIDGE_IMAGE line to:
+
+BRIDGE_IMAGE=localhost/simply-bridge:0.21.3
+
+Save and exit. Then verify:
+
+grep '^BRIDGE_IMAGE=' .env
+
+Expected: BRIDGE_IMAGE=localhost/simply-bridge:0.21.3
+
+9. Validate Compose before restarting
+-------------------------------------
+
+podman compose -f compose.yaml -f compose-ca.yaml config | grep -i 'image:'
+
+Expected: image: localhost/simply-bridge:0.21.3
+Do not continue if the image ends with a slash or shows another tag.
+
+If this installation does not use compose-ca.yaml, use:
+
+podman compose -f compose.yaml config | grep -i 'image:'
+
+10. Recreate the container while preserving data
+-------------------------------------------------
+
+podman compose -f compose.yaml -f compose-ca.yaml down
+
+Expected: the bridge container stops. Never add -v.
+
+podman compose -f compose.yaml -f compose-ca.yaml up -d --no-build --force-recreate
+
+Expected: the bridge container is created and started.
+
+11. Verify health and version
+-----------------------------
+
+podman compose -f compose.yaml -f compose-ca.yaml ps
+
+Expected: the bridge service is Up or Running.
+
+podman compose -f compose.yaml -f compose-ca.yaml logs --tail=50 bridge
+
+Expected: SIMPLY BRIDGE 0.21.3 and no startup error.
+Open the normal browser URL and confirm v0.21.3 in the lower corner.
+
+ROLLBACK
+========
+
+1. Stop the 0.21.3 container without deleting the data volume:
+
+cd ~/simply-bridge
+
+podman compose -f compose.yaml -f compose-ca.yaml down
+
+2. Restore the exact previous environment file:
+
+cp -p .env.before-0.21.3 .env
+
+3. Verify that BRIDGE_IMAGE points to the previous tag:
+
+grep '^BRIDGE_IMAGE=' .env
+
+4. Start the previous image:
+
+podman compose -f compose.yaml -f compose-ca.yaml up -d --no-build --force-recreate
+
+5. Verify the restored version:
+
+podman compose -f compose.yaml -f compose-ca.yaml logs --tail=50 bridge
+
+The named data volume is retained throughout update and rollback.
+
+
+
+

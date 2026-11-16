@@ -70,6 +70,16 @@
                     "number"
                   ]
                 },
+                "groupIndexes": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                },
                 "data": {
                   "type": "object"
                 }

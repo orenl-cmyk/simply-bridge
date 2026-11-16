@@ -1,4 +1,4 @@
-#define AppVersion "0.16.0"
+#define AppVersion "0.16.4"
 #define StageDir "..\\build\\windows-stage"
 
 [Setup]
@@ -34,3 +34,4 @@ Name: "{autodesktop}\\SIMPLY BRIDGE"; Filename: "{app}\\SimplyBridge.exe"; Worki
 
 [Run]
 Filename: "{app}\\SimplyBridge.exe"; Description: "Launch SIMPLY BRIDGE"; Flags: nowait postinstall skipifsilent
+

@@ -12,7 +12,7 @@ fi
 if grep -q 'YOUR-LINUX-SERVER' .env; then
   echo 'Set PUBLIC_URL in .env before starting.' >&2; exit 1
 fi
-docker load -i simply-bridge-image.tar
+docker load -i simply-bridge-update.tar
 docker compose up -d --pull never --no-build
 docker compose ps
 echo 'Open the PUBLIC_URL configured in .env. View logs: docker compose logs --tail 100 bridge'

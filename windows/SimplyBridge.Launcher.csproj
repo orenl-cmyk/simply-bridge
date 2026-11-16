@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SimplyBridge</AssemblyName>
     <RootNamespace>SimplyBridge</RootNamespace>
-    <Version>0.16.0</Version>
+    <Version>0.16.4</Version>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -15,3 +15,4 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 </Project>
+

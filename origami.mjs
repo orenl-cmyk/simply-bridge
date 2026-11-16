@@ -1,20 +1,22 @@
-import {origamiLimiter} from './rate-limit.mjs';
+import {rateOptions,noteRateLimit,rateSnapshot} from './rate-limit.mjs';
+import {postJson} from './transport.mjs';
 const error=(status,message)=>Object.assign(new Error(message),{status});
 export async function readOrigami(connection,operation,params={},onDebug=()=>{},beforeRequest=()=>{}){
  const attempts=[];let last;
  for(let attempt=0;attempt<3;attempt++){
+  const {state,spacingMs,maxConcurrent}=rateOptions(connection);
   const queued=Date.now();
   try{
-   const data=await origamiLimiter.run(async()=>{beforeRequest();return performRead(connection,operation,params,d=>{last=d;d.queueWaitMs=Date.now()-queued-d.durationMs;});});
-   onDebug({...last,attempts,rateLimit:{spacingMs:150,maxConcurrent:3}});return data;
+   const data=await state.limiter.run(async()=>{beforeRequest();return performRead(connection,operation,params,d=>{last=d;d.queueWaitMs=Date.now()-queued-d.durationMs;});},{spacingMs,maxConcurrent});
+   onDebug({...last,attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});return data;
   }catch(e){
    if(!last)throw e;
    attempts.push({attempt:attempt+1,status:last.response?.status??null,durationMs:last.durationMs,error:last.error});
-   if(last.response?.status!==429||attempt===2){onDebug({...last,attempts,rateLimit:{spacingMs:150,maxConcurrent:3}});throw e;}
+   if(last.response?.status!==429||attempt===2){onDebug({...last,attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});throw e;}
    const header=last.response.headers['retry-after'];const numeric=header==null?NaN:Number(header);
    const wait=Number.isFinite(numeric)?numeric*1000:header?Date.parse(header)-Date.now():1000*2**attempt;
    const pause=Number.isFinite(wait)?Math.max(1000,wait):1000*2**attempt;
-   origamiLimiter.pause(pause);last=null;
+   noteRateLimit(connection,pause);last=null;
   }
  }
 }
@@ -26,7 +28,7 @@ async function performRead(connection,operation,params={},onDebug=()=>{}){
  function causes(e,depth=0){if(!e||depth>4)return undefined;return {name:e.name,code:e.code,message:redact(String(e.message||'')),syscall:e.syscall,hostname:e.hostname,address:e.address,port:e.port,cause:causes(e.cause,depth+1),errors:e.errors?.slice(0,5).map(x=>causes(x,depth+1))};}
  let stage='connect';
  try{
-  const response=await fetch(url,{method:'POST',redirect:'error',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({username:connection.username,api_secret:connection.secret,...params})});
+  const response=await postJson(url,{username:connection.username,api_secret:connection.secret,...params},{timeoutMs:30000});
   stage='read-response';debug.response={status:response.status,statusText:response.statusText,headers:Object.fromEntries(['content-type','content-length','server','date','retry-after'].map(k=>[k,response.headers.get(k)]).filter(([,v])=>v!==null))};
   const text=await response.text();let data;try{data=JSON.parse(text);}catch{}
   const preview=typeof data==='undefined'?redact(text):JSON.stringify(redact(data),null,2);

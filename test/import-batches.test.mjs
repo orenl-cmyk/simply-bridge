@@ -1,0 +1,5 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';
+import {createImportBatches} from '../public/import-batches.js';
+const mapping=count=>({targetId:'target',targetKey:{kind:'field',groupId:'g',fieldId:'key'},entity:{meta:{dataName:'source',recordCount:count},records:Array.from({length:count},(_,i)=>({id:'id-'+i,matchKey:'key-'+i,data:{}}))}});
+test('a 40,000 record import is split into bounded 500-record batches without losing records',()=>{const {batches,totalRecords}=createImportBatches([mapping(40000)]);assert.equal(totalRecords,40000);assert.equal(batches.length,80);assert.ok(batches.every(batch=>batch.entity.records.length===500));assert.equal(new Set(batches.flatMap(batch=>batch.entity.records.map(record=>record.id))).size,40000);});
+test('batching detects duplicate destination keys before any request is started',()=>{const value=mapping(2);value.entity.records[1].matchKey=value.entity.records[0].matchKey;assert.throws(()=>createImportBatches([value]),/יותר מרשומת מקור אחת/);});
