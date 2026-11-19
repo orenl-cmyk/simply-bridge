@@ -13,7 +13,14 @@ test('debug reports preserve network causes and redact credentials in reflected 
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
  const port=server.address().port,c={baseUrl:`http://127.0.0.1:${port}`,username,secret};
  try{await assert.rejects(readOrigami(c,'entities_list',{},d=>debug=d));assert.equal(debug.response.status,200);assert.equal(debug.failureStage,'api-result');assert.equal(debug.request.method,'POST');assert.equal(debug.request.body.api_secret,'[REDACTED]');const report=JSON.stringify(debug);for(const s of [secret,username,'hidden-token','also-hidden'])assert.equal(report.includes(s),false);assert.ok(report.includes('[REDACTED]'));}finally{await new Promise(r=>server.close(r));}
- await assert.rejects(readOrigami(c,'entities_list',{},d=>debug=d));assert.equal(debug.response,null);assert.equal(debug.failureStage,'connect');assert.ok(JSON.stringify(debug.error).includes('ECONNREFUSED'));assert.ok(debug.durationMs>=0);
+ await assert.rejects(readOrigami(c,'entities_list',{},d=>debug=d,()=>{},{maxAttempts:1}));assert.equal(debug.response,null);assert.equal(debug.failureStage,'connect');assert.ok(JSON.stringify(debug.error).includes('ECONNREFUSED'));assert.ok(debug.durationMs>=0);
+});
+test('read-only API retries transient network failures and reports retry progress',async()=>{
+ let calls=0;const traces=[];
+ const server=http.createServer(async(req,res)=>{calls++;for await(const _ of req){}if(calls<3){req.socket.destroy();return;}res.setHeader('Content-Type','application/json');res.end(JSON.stringify([{entity_data_name:'issues',entity_name:'Issues'}]));});
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ const c={baseUrl:`http://127.0.0.1:${server.address().port}`,username:'demo',secret:'test-only'};
+ try{const result=await readOrigami(c,'entities_list',{},d=>traces.push(d),()=>{},{maxAttempts:5,baseDelayMs:1});assert.equal(calls,3);assert.equal(result[0].entity_data_name,'issues');assert.equal(traces.filter(t=>t.outcome==='retrying').length,2);assert.equal(traces.at(-1).attempts.length,2);}finally{await new Promise(r=>server.close(r));}
 });
 test('list and nested schema normalization preserves empty repeating groups',()=>{
  assert.deepEqual(normalizeEntities({entities:{data:[{entity_data_name:'a',entity_name:'A'},{entity_data_name:'a'}]}}),[{id:'a',name:'A'}]);

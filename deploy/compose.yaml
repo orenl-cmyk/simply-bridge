@@ -1,7 +1,7 @@
 name: simply-bridge
 services:
   bridge:
-    image: ${BRIDGE_IMAGE:-simply-bridge:0.22.0}
+    image: ${BRIDGE_IMAGE:-simply-bridge:0.23.0}
     pull_policy: never
     restart: unless-stopped
     init: true

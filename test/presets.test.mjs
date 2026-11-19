@@ -5,7 +5,7 @@ import {spawn} from 'node:child_process';
 import {readFile,mkdir,mkdtemp} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
-import {createLimiter} from '../rate-limit.mjs';
+import {createLimiter,rateEtaSeconds} from '../rate-limit.mjs';
 import {readOrigami} from '../origami.mjs';
 const root=fileURLToPath(new URL('../',import.meta.url));
 const schema={instance_data:{field_groups:[{field_group_data:{group_data_name:'main'},fields_data:[[{field_data_name:'title'},{field_data_name:'external_id'}]]},{field_group_data:{group_data_name:'rows',repeatable_group:'1'},fields_data:[[{field_data_name:'note'}]]}]}};
@@ -14,6 +14,12 @@ test('global limiter keeps simultaneous callers below 10 starts per second and l
  await Promise.all(Array.from({length:16},()=>limiter.run(async()=>{starts.push(performance.now());active++;max=Math.max(max,active);await new Promise(r=>setTimeout(r,350));active--;})));
  for(const t of starts)assert.ok(starts.filter(x=>x>=t&&x<t+1000).length<=10);
  assert.ok(max<=3);assert.equal(starts.length,16);
+});
+test('hourly quota waits for the rolling window and ETA includes quota resets',async()=>{
+ const limiter=createLimiter({spacingMs:0,maxConcurrent:3,windowMs:80}),starts=[];
+ await Promise.all(Array.from({length:3},()=>limiter.run(()=>starts.push(Date.now()),{spacingMs:0,maxConcurrent:3,maxRequestsPerHour:2})));
+ assert.ok(starts[2]-starts[0]>=70);const snapshot=limiter.snapshot(2);assert.equal(snapshot.hourlyRemaining,1);
+ assert.equal(rateEtaSeconds({configuredHourly:5000,hourlyRemaining:0,hourlyResetMs:60000,effectiveRps:10},5001),3660);
 });
 test('429 retries with shared cooldown and records retry history',async()=>{
  let calls=0,first=0,debug;const server=http.createServer((req,res)=>{calls++;if(calls===1){first=Date.now();res.writeHead(429,{'Retry-After':'1'});res.end('{"error":"rate limited"}');}else{assert.ok(Date.now()-first>=990);res.end('[]');}});

@@ -30,6 +30,7 @@ test('encrypted connection lifecycle, authorization, persistence and secret rete
  assert.equal((await call('connections',{...connection,baseUrl:'javascript:alert(1)'})).status,400);
  const saved=await call('connections',connection);assert.equal(saved.status,200);
  assert.equal(saved.data.connections[0].baseUrl,'https://internal.example:8443/origami');
+ assert.equal(saved.data.connections[0].maxRequestsPerHour,5000);
  assert.equal('secret' in saved.data.connections[0],false);
  const id=saved.data.connections[0].id;
  assert.equal((await call('select',{id})).data.activeId,id);
@@ -47,6 +48,7 @@ test('encrypted connection lifecycle, authorization, persistence and secret rete
  await stop();await launch();
  assert.equal((await call('connections')).status,401);
  const restored=await call('unlock',{username:'admin',password});assert.equal(restored.data.activeId,id);assert.equal(restored.data.connections.length,1);
+ const retained=await call('connections',{...connection,id,name:'אחרי אתחול',secret:''});assert.equal(retained.status,200);assert.equal(retained.data.connections[0].hasSecret,true);
  const removed=await call('delete',{id});assert.equal(removed.data.connections.length,0);assert.equal(removed.data.activeId,null);
  assert.equal((await call('select',{id})).status,404);
  await call('lock',{});

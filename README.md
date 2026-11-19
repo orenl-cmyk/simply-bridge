@@ -1,6 +1,6 @@
-# SIMPLY BRIDGE — גרסה 0.22.0
+# SIMPLY BRIDGE — גרסה 0.22.2
 
-## Docker מקומי — 0.22.0
+## Docker מקומי — 0.22.2
 
 הקונטיינר מאזין בפורט `4318`, רץ כמשתמש `node` שאינו root, ושומר את `DATA_DIR=/app/data` ב־volume בשם `simply-bridge-data`. קובץ `.dockerignore` הוא allowlist: תיקיית `data/`, כספות, קובצי `.env`, תיקיות העבודה וחבילות build אינן נכנסות ל־build context או לתמונה.
 
@@ -34,7 +34,7 @@ docker compose logs -f bridge
 
 ```powershell
 docker inspect --format '{{.State.Health.Status}}' simply-bridge-bridge-1
-(Invoke-WebRequest http://127.0.0.1:4318/).Content | Select-String 'SIMPLY BRIDGE · v0.22.0'
+(Invoke-WebRequest http://127.0.0.1:4318/).Content | Select-String 'SIMPLY BRIDGE · v0.22.2'
 ```
 
 Upgrade בלי למחוק את ה־volume (יש להחליף את התג בגרסה החדשה):
@@ -79,7 +79,7 @@ $env:DATA_VOLUME='simply-bridge-data-restored'; docker compose up -d --force-rec
 
 `npm test` מריץ 52 בדיקות אוטומטיות. הן מכסות כספת ומשתמשים, פריסטים, ייצוא, מיפוי, Dry Run, סדר כתיבה קפוא, כתיבה מקבילית, המשך לאחר כשל, התאוששות מתוצאה לא ידועה, Rate Limit אדפטיבי וקבצי הממשק.
 
-חבילת Podman של 0.21.3 מעדכנת את image בלבד. היא אינה מחליפה `.env`, קובצי Compose, הגדרת Nginx או את ה־named volume. הוראות מדורגות ורולבק נמצאות ב־`deploy/UPDATE-FROM-0.19.5.txt`.
+חבילת Podman/Docker של 0.22.2 מעדכנת את image בלבד. היא אינה מחליפה `.env`, קובצי Compose, הגדרת Nginx או את ה־named volume. הוראות מדורגות ורולבק נמצאות ב־`deploy/UPDATE-PODMAN.txt`.
 
 ## תיעוד הבסיס והגרסאות הקודמות
 הסעיפים הבאים מתארים את התפתחות היישום; יכולת RUN המתוארת לעיל מחליפה את מגבלת ״Dry Run בלבד״ של 0.5.

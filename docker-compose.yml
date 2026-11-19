@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${BRIDGE_IMAGE:-simply-bridge:0.22.0}
+    image: ${BRIDGE_IMAGE:-simply-bridge:0.23.0}
     restart: unless-stopped
     init: true
     ports:

@@ -35,7 +35,7 @@ wait_healthy(){
 }
 run_smoke
 wait_healthy
-curl --fail --silent --show-error http://127.0.0.1:4318/ | grep -F 'SIMPLY BRIDGE · v0.22.0' >/dev/null
+curl --fail --silent --show-error http://127.0.0.1:4318/ | grep -F "SIMPLY BRIDGE · v${version}" >/dev/null
 [ "$(docker inspect --format '{{.Config.User}}' "$smoke_container")" = node ]
 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$smoke_container" | grep -Fx 'DATA_DIR=/app/data' >/dev/null
 [ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}' "$smoke_container")" = "$smoke_volume" ]
@@ -56,7 +56,6 @@ docker tag "$image" "$current"
 docker image save -o "$release_dir/simply-bridge-update.tar" "$image" "$current"
 docker image inspect "$image" > "$release_dir/image-info.json"
 printf '%s\n' "$platform" > "$release_dir/platform.txt"
-cp deploy/compose.yaml deploy/compose-ca.yaml deploy/.env.example deploy/install-offline.sh deploy/DEPLOY.md deploy/UPDATE-PODMAN.txt "$release_dir/"
-(cd "$release_dir" && sha256sum simply-bridge-update.tar image-info.json platform.txt compose.yaml compose-ca.yaml .env.example install-offline.sh DEPLOY.md UPDATE-PODMAN.txt > SHA256SUMS && zip -q simply-bridge-offline.zip simply-bridge-update.tar image-info.json platform.txt compose.yaml compose-ca.yaml .env.example install-offline.sh DEPLOY.md UPDATE-PODMAN.txt SHA256SUMS && zip -q simply-bridge-update.zip simply-bridge-update.tar UPDATE-PODMAN.txt)
+cp deploy/compose.yaml deploy/compose-ca.yaml deploy/.env.example deploy/install-offline.sh deploy/DEPLOY.md deploy/UPDATE-PODMAN.txt deploy/README-RED-UPDATE.md deploy/README-BLACK-FRESH-INSTALL.md "$release_dir/"
+(cd "$release_dir" && sha256sum simply-bridge-update.tar image-info.json platform.txt compose.yaml compose-ca.yaml .env.example install-offline.sh DEPLOY.md README-BLACK-FRESH-INSTALL.md > SHA256SUMS && zip -q "simply-bridge-${version}-BLACK-FRESH-INSTALL.zip" simply-bridge-update.tar image-info.json platform.txt compose.yaml compose-ca.yaml .env.example install-offline.sh DEPLOY.md README-BLACK-FRESH-INSTALL.md SHA256SUMS && sha256sum simply-bridge-update.tar > RED-SHA256SUMS.txt && zip -q "simply-bridge-${version}-RED-UPDATE.zip" simply-bridge-update.tar README-RED-UPDATE.md RED-SHA256SUMS.txt)
 printf 'Offline bundle: %s/simply-bridge-offline.zip\n' "$release_dir"
-

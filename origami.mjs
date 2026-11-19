@@ -1,22 +1,40 @@
 import {rateOptions,noteRateLimit,rateSnapshot} from './rate-limit.mjs';
 import {postJson} from './transport.mjs';
+import {classifyOrigamiResult} from './origami-result.mjs';
 const error=(status,message)=>Object.assign(new Error(message),{status});
-export async function readOrigami(connection,operation,params={},onDebug=()=>{},beforeRequest=()=>{}){
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const transientCodes=new Set(['ETIMEDOUT','ECONNRESET','ECONNREFUSED','EPIPE','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_SOCKET']);
+function debugCodes(value,codes=new Set()){
+ if(!value||typeof value!=='object')return codes;
+ if(typeof value.code==='string')codes.add(value.code);
+ debugCodes(value.cause,codes);for(const item of value.errors||[])debugCodes(item,codes);return codes;
+}
+function retryableRead(debug){
+ const status=Number(debug?.response?.status||0);
+ if([408,425,429,500,502,503,504].includes(status))return true;
+ if(['rate_limit','system'].includes(debug?.error?.kind))return true;
+ if(debug?.response)return false;
+ return [...debugCodes(debug?.error)].some(code=>transientCodes.has(code));
+}
+export async function readOrigami(connection,operation,params={},onDebug=()=>{},beforeRequest=()=>{},retryPolicy={}){
+ const requestedDelay=Number(retryPolicy.baseDelayMs),maxAttempts=Math.max(1,Number(retryPolicy.maxAttempts)||5),baseDelayMs=Number.isFinite(requestedDelay)?Math.max(0,requestedDelay):500;
  const attempts=[];let last;
- for(let attempt=0;attempt<3;attempt++){
-  const {state,spacingMs,maxConcurrent}=rateOptions(connection);
+ for(let attempt=0;attempt<maxAttempts;attempt++){
+  const {state,spacingMs,maxConcurrent,maxRequestsPerHour}=rateOptions(connection);
   const queued=Date.now();
   try{
-   const data=await state.limiter.run(async()=>{beforeRequest();return performRead(connection,operation,params,d=>{last=d;d.queueWaitMs=Date.now()-queued-d.durationMs;});},{spacingMs,maxConcurrent});
+   const data=await state.limiter.run(async()=>{beforeRequest();return performRead(connection,operation,params,d=>{last=d;d.queueWaitMs=Date.now()-queued-d.durationMs;});},{spacingMs,maxConcurrent,maxRequestsPerHour});
    onDebug({...last,attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});return data;
   }catch(e){
    if(!last)throw e;
    attempts.push({attempt:attempt+1,status:last.response?.status??null,durationMs:last.durationMs,error:last.error});
-   if(last.response?.status!==429||attempt===2){onDebug({...last,attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});throw e;}
-   const header=last.response.headers['retry-after'];const numeric=header==null?NaN:Number(header);
-   const wait=Number.isFinite(numeric)?numeric*1000:header?Date.parse(header)-Date.now():1000*2**attempt;
-   const pause=Number.isFinite(wait)?Math.max(1000,wait):1000*2**attempt;
-   noteRateLimit(connection,pause);last=null;
+   const canRetry=retryableRead(last)&&attempt<maxAttempts-1;
+   if(!canRetry){onDebug({...last,attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});throw e;}
+   const header=last.response?.headers?.['retry-after'],numeric=header==null?NaN:Number(header),headerDelay=Number.isFinite(numeric)?numeric*1000:header?Date.parse(header)-Date.now():NaN;
+   const pause=Number.isFinite(headerDelay)?Math.max(1000,headerDelay):baseDelayMs*2**attempt;
+   if(last.response?.status===429||last.error?.kind==='rate_limit')noteRateLimit(connection,pause);
+   onDebug({...last,outcome:'retrying',retry:{attempt:attempt+1,nextAttempt:attempt+2,maxAttempts,pauseMs:pause},attempts,rateLimit:{...rateSnapshot(connection),spacingMs}});
+   if(pause>0)await wait(pause);last=null;
   }
  }
 }
@@ -25,7 +43,7 @@ async function performRead(connection,operation,params={},onDebug=()=>{}){
  const url=connection.baseUrl.replace(/\/+$/,'')+'/entities/api/'+operation+'/format/json';
  const started=Date.now(),debug={startedAt:new Date(started).toISOString(),operation,request:{url,method:'POST',headers:{'Content-Type':'application/json'},body:{username:'[REDACTED]',api_secret:'[REDACTED]',...params},timeoutMs:30000,redirect:'error'},runtime:{node:process.version,platform:process.platform,execution:'local Node.js server'},response:null};
  const redact=value=>{if(typeof value==='string'){let text=value;for(const v of [connection.secret,connection.username].filter(Boolean)){for(const variant of [v,encodeURIComponent(v),JSON.stringify(v).slice(1,-1)])text=text.split(variant).join('[REDACTED]');}return text.replace(/((?:api_secret|password|authorization|access_token|refresh_token|cookie)["']?\s*[:=]\s*)["']?[^\s,"'<>}]+/gi,'$1[REDACTED]');}if(Array.isArray(value))return value.map(redact);if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([k,v])=>[k, /secret|password|token|authorization|cookie|username/i.test(k)?'[REDACTED]':redact(v)]));return value;};
- function causes(e,depth=0){if(!e||depth>4)return undefined;return {name:e.name,code:e.code,message:redact(String(e.message||'')),syscall:e.syscall,hostname:e.hostname,address:e.address,port:e.port,cause:causes(e.cause,depth+1),errors:e.errors?.slice(0,5).map(x=>causes(x,depth+1))};}
+ function causes(e,depth=0){if(!e||depth>4)return undefined;return {name:e.name,code:e.code,kind:e.kind,status:e.status,message:redact(String(e.message||'')),syscall:e.syscall,hostname:e.hostname,address:e.address,port:e.port,cause:causes(e.cause,depth+1),errors:e.errors?.slice(0,5).map(x=>causes(x,depth+1))};}
  let stage='connect';
  try{
   const response=await postJson(url,{username:connection.username,api_secret:connection.secret,...params},{timeoutMs:30000});
@@ -33,9 +51,8 @@ async function performRead(connection,operation,params={},onDebug=()=>{}){
   const text=await response.text();let data;try{data=JSON.parse(text);}catch{}
   const preview=typeof data==='undefined'?redact(text):JSON.stringify(redact(data),null,2);
   debug.response.bodyPreview=preview.slice(0,12000);debug.response.truncated=preview.length>12000;
-  if(!response.ok)throw error(502,`סימפלי החזירה HTTP ${response.status}. בדקו הרשאות ופרטי חיבור.`);
   stage='parse-json';if(typeof data==='undefined')throw error(502,'סימפלי החזירה תשובה שאינה JSON. בדקו את כתובת הבסיס.');
-  stage='api-result';if(operation==='instance_data'&&data?.error?.type==='query'&&data.error.message==='No Results'){debug.outcome='success';return {data:[],info:{total_count:0}};}if(!data||typeof data!=='object'||data.error||data.errors||data.success===false)throw error(502,'סימפלי דיווחה על שגיאה. בדקו את פרטי ה־API ואת הרשאות הגישה למבנה הישויות.');
+  stage='api-result';if(operation==='instance_data'&&data?.error?.type==='query'&&data.error.message==='No Results'){debug.outcome='success';return {data:[],info:{total_count:0}};}const classified=classifyOrigamiResult({status:response.status,data,responseOk:response.ok});if(classified.kind!=='success'){const messages={rate_limit:'SIMPLY הגבילה את קצב הבקשות.',authorization:'הבקשה נדחתה בהרשאה. בדקו את משתמש ה־API והמפתח.',validation:'SIMPLY דחתה את נתוני הבקשה.',system:'SIMPLY החזירה שגיאת מערכת זמנית.',api_error:'SIMPLY דיווחה על שגיאת API.',http_error:`SIMPLY החזירה HTTP ${response.status}.`},e=error(classified.kind==='authorization'?403:classified.kind==='validation'?422:classified.kind==='rate_limit'?429:502,messages[classified.kind]||'SIMPLY דיווחה על שגיאה.');e.kind=classified.kind;e.details=redact(classified.error);throw e;}
   debug.outcome='success';return data;
  }catch(e){debug.outcome='error';debug.failureStage=stage;debug.error=causes(e);if(e.status)throw e;throw error(502,'לא ניתן להשלים את הבקשה לסימפלי. פרטי הרשת והשגיאה זמינים בקונסול הדיבוג.');}
  finally{debug.durationMs=Date.now()-started;onDebug(redact(debug));}
