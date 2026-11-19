@@ -5,7 +5,7 @@ import path from 'node:path';
 import {randomBytes} from 'node:crypto';
 import {saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState} from '../job-store.mjs';
 
-const work=path.resolve('work');await mkdir(work,{recursive:true});
+const work=path.resolve('/work');await mkdir(work,{recursive:true});
 test('encrypted jobs, plans, inputs and append-only progress survive a fresh load',async()=>{
  const directory=await mkdtemp(path.join(work,'durable-test-')),key=randomBytes(32),secret='SHOULD-NOT-APPEAR-IN-FILES';
  await saveDurableJob(directory,key,'job-1',{state:'running',label:secret,workerActive:true});
