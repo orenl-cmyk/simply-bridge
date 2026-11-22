@@ -1,11 +1,12 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdir,mkdtemp,readFile,writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {randomBytes,createCipheriv} from 'node:crypto';
 import {saveSegmentedPlan,loadPlanWork,loadPlanLinks,finishPlanLink,loadPlanMapping,saveWriteIntent,finishWriteIntent,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState} from '../job-store.mjs';
 
-const work=path.resolve('/work');await mkdir(work,{recursive:true});
+const work=tmpdir();
 function seal(value,key){
   const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',key,iv);
   const ciphertext=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);
