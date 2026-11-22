@@ -78,7 +78,10 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  assert.equal(group.kind,'not_found');
  assert.equal(group.count,1);
  rows.set('repair key',{_id:'replacement',field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:'repair key'}]]}]});
- assert.equal((await call('repairs/retry-relations',{jobId:needsRepair.jobId,groupId:group.groupId})).status,202);
+ const repairRequest={jobId:needsRepair.jobId,groupId:group.groupId};
+ assert.equal((await call('repairs/retry-relations',{...repairRequest,mapping:null})).status,422);
+ const correctedMapping={sourceRelatedEntity:'users',targetEntity:'appUsers',targetGroup:'g',targetField:'external',valueMode:'sourceText'};
+ assert.equal((await call('repairs/retry-relations',{...repairRequest,mapping:correctedMapping})).status,202);
  for(let i=0;i<100;i++){
   if((await call('import/run/status',{jobId:needsRepair.jobId})).state==='done')break;
   await new Promise(resolve=>setTimeout(resolve,25));

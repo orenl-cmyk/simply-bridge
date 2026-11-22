@@ -2,7 +2,7 @@ import {resolveBlackIssue,validateBlackConfig} from './black-issue-resolver.mjs'
 import {createRelationFinalizer,indexImportIdentities,validateRelationRuleSets} from './relation-finalizer.mjs';
 import {exportAll} from './export-pages.mjs';
 import {prepareImport,materializeDependencies,nodeKey} from './import-plan.mjs';
-import {fetchRelations,verifyRelations} from './relations.mjs';
+import {fetchRelations,verifyRelations,checkKey} from './relations.mjs';
 import {validateImportPreset} from './import-presets.mjs';
 import {applyImportMapping} from './public/import-mapping.js';
 import http from 'node:http';
@@ -320,12 +320,16 @@ async function runBackgroundImport(jobId,s,{finalize=true}={}){
   }};
  try{const concurrency=Math.min(Math.max(1,job.order.length-completed.size),connection.maxConcurrentRequests||3);await Promise.all(Array.from({length:concurrency},workerLoop));if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};if(finalize&&job.state!=='paused')job.finishedAt=Date.now();await storeJob(jobId,job,worker.key);}catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
 }
-function issueGroupKey(issue){return JSON.stringify([issue.kind,issue.entity,issue.fieldId,issue.role,issue.message]);}
+function issueGroupKey(issue){return JSON.stringify([issue.kind,issue.entity,issue.fieldId,issue.sourceEntity,issue.role,issue.message]);}
 const relationRepairWorkers=new Set();
 
 function replaceRelationIssues(job,event){
  const retried=new Set(event.retried);
  if(event.choices)job.relationChoices={...job.relationChoices,...event.choices};
+ for(const rule of event.mappingOverride||[]){
+  job.relationRuleOverrides??={};
+  job.relationRuleOverrides[JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId])]=rule;
+ }
  job.relationIssues=job.relationIssues.filter(issue=>
   issueGroupKey(issue)!==event.group||!retried.has(issue.cursor)
  );
@@ -335,7 +339,7 @@ function replaceRelationIssues(job,event){
  }
 }
 
-async function retryRelationGroup(jobId,job,{group,items,choices,rules},connection,key,actor){
+async function retryRelationGroup(jobId,job,{group,items,choices,rules,mappingOverride},connection,key,actor){
  try{
   const input=runtimeInputs.get(job.inputId);
   const identities=indexImportIdentities(job.planIds.map(id=>[id,runtimePlans.get(id)]),runtimeOutcomes);
@@ -350,8 +354,8 @@ async function retryRelationGroup(jobId,job,{group,items,choices,rules},connecti
    const target=identities.get(JSON.stringify([plan.sourceEntity.meta.dataName,entity,sourceId]));
    if(!target?.id)continue;
    const problems=await finalize({envelope,entity,id:target.id,schema:plan.schema,indexes:record.groupIndexes,recover:true,choices:{...job.relationChoices,...choices}});
-   const event={type:'relation-repair',group,retried:[cursor],actor,choices,mapping:rules.filter(rule=>rule.sourceEntity===plan.sourceEntity.meta.dataName&&(!fieldId||rule.fieldId===fieldId)),at:new Date().toISOString(),
-    issues:problems.map(problem=>({...problem,entity,sourceId,planId,cursor}))};
+   const event={type:'relation-repair',group,retried:[cursor],actor,choices,mappingOverride,mapping:rules.filter(rule=>rule.sourceEntity===plan.sourceEntity.meta.dataName&&(!fieldId||rule.fieldId===fieldId)),at:new Date().toISOString(),
+    issues:problems.map(problem=>({...problem,entity,sourceId,sourceEntity:plan.sourceEntity.meta.dataName,planId,cursor}))};
    await appendDurableEvent(directory,key,jobId,event);
    replaceRelationIssues(job,event);
   }
@@ -460,7 +464,7 @@ function pipelineRelationWorker(jobId,job,worker,input){
     }
     problems=await finalize({envelope,entity:plan.targetId,id,schema:plan.schema,indexes:record.groupIndexes,recover});
    }else if(envelope.relations.length)problems=[{kind:'needs_attention',message:'רשומת הייבוא אינה זמינה להשלמת קישורים.'}];
-   const issues=problems.map(problem=>({...problem,entity:plan.targetId,sourceId:record.id,planId,cursor:taskId}));
+   const issues=problems.map(problem=>({...problem,entity:plan.targetId,sourceId:record.id,sourceEntity:plan.sourceEntity.meta.dataName,planId,cursor:taskId}));
    await appendDurableEvent(directory,worker.key,jobId,{type:'relation-progress',taskId,issues});
    job.relationInFlight=null;
    completed.add(taskId);
@@ -599,7 +603,7 @@ async function api(req,res,url){
  }
  if(url==='/api/repairs/retry-relations'&&method==='POST'){
   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
-  const {jobId,groupId,matchKey,targetId}=await bodyOf(req),job=backgroundJobs.get(jobId);
+  const {jobId,groupId,matchKey,targetId,mapping}=await bodyOf(req),job=backgroundJobs.get(jobId);
   if(!job||job.relationsClosedAt||!['done','completed_with_gaps'].includes(job.state)||relationRepairWorkers.has(jobId)){
    throw fail(409,'המשימה אינה זמינה לניסיון חוזר.');
   }
@@ -616,9 +620,30 @@ async function api(req,res,url){
   }
   const items=[...new Map(matching.map(issue=>[issue.cursor,issue])).values()];
   if(!items.length)throw fail(404,'קבוצת החריגים או רשומת היעד לא נמצאו.');
+  const keyOf=rule=>JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId]);
+  const rulesByKey=new Map((relationRules.get(job.connectionId)||input.finalizerRules).map(rule=>[keyOf(rule),rule]));
+  for(const rule of Object.values(job.relationRuleOverrides||{}))rulesByKey.set(keyOf(rule),rule);
+  let mappingOverride;
+  if(mapping!==undefined){
+   if(!mapping||typeof mapping!=='object'||Array.isArray(mapping))throw fail(422,'פרטי מיפוי הקישור אינם תקינים.');
+   const item=items[0],plan=runtimePlans.get(item.planId);
+   const fieldGroup=plan.schema.groups.find(group=>group.fields.some(field=>field.id===item.fieldId));
+   if(!fieldGroup||items.some(other=>other.sourceEntity!==item.sourceEntity||other.fieldId!==item.fieldId)){
+    throw fail(422,'בחרו קבוצת חריגים של שדה קישור יחיד.');
+   }
+   const rule={sourceEntity:plan.sourceEntity.meta.dataName,groupId:fieldGroup.id,fieldId:item.fieldId,
+    sourceRelatedEntity:mapping.sourceRelatedEntity,targetEntity:mapping.targetEntity,valueMode:mapping.valueMode,
+    targetKey:{kind:'field',groupId:mapping.targetGroup,fieldId:mapping.targetField}};
+   try{validateRelationRuleSets({rules:[rule]});}
+   catch{throw fail(422,'פרטי מיפוי הקישור אינם תקינים.');}
+   const targetSchema=normalizeStructure(await readOrigami(connection,'entity_structure',{entity_data_name:rule.targetEntity}));
+   checkKey(targetSchema,rule.targetKey);
+   rulesByKey.set(keyOf(rule),rule);
+   mappingOverride=[rule];
+  }
+  const rules=[...rulesByKey.values()];
   relationRepairWorkers.add(jobId);
-  const rules=relationRules.get(job.connectionId)||input.finalizerRules;
-  void retryRelationGroup(jobId,job,{group:groupId,items,choices,rules},connection,Buffer.from(s.key),s.userId)
+  void retryRelationGroup(jobId,job,{group:groupId,items,choices,rules,mappingOverride},connection,Buffer.from(s.key),s.userId)
    .catch(()=>console.error('Relation retry interrupted',jobId));
   return send(res,202,{scheduled:items.length,expiresAt:s.last+ttl});
  }
@@ -629,7 +654,7 @@ async function api(req,res,url){
    const groupId=issueGroupKey(issue),key=JSON.stringify([jobId,groupId]);
    if(!groups.has(key))groups.set(key,{jobId,groupId,...issue,count:0,records:[],
     canRetry:!!issue.planId&&!backgroundJobs.get(jobId)?.relationsClosedAt&&['done','completed_with_gaps'].includes(backgroundJobs.get(jobId)?.state),
-    retryActive:relationRepairWorkers.has(jobId),matches:[]});
+    retryActive:relationRepairWorkers.has(jobId),matches:[],canMap:!!issue.fieldId&&!!issue.planId});
    const group=groups.get(key);
    group.count++;
    if(issue.matchKey&&group.matches.length<50&&!group.matches.some(match=>match.key===issue.matchKey)){
