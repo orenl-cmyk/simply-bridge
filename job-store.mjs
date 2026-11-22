@@ -3,7 +3,7 @@ import {createReadStream} from 'node:fs';
 import {createInterface} from 'node:readline';
 import {DatabaseSync} from 'node:sqlite';
 import path from 'node:path';
-import {randomBytes,randomUUID,createCipheriv,createDecipheriv} from 'node:crypto';
+import {randomBytes,randomUUID,createCipheriv,createDecipheriv,createHmac} from 'node:crypto';
 
 const validId=value=>{const id=String(value||'');if(!/^[A-Za-z0-9:_-]{1,160}$/.test(id))throw Error('Invalid durable object id');return id;};
 const rootOf=directory=>path.join(directory,'jobs-v1');
@@ -104,6 +104,8 @@ async function openStore(directory,key){
    CREATE TABLE IF NOT EXISTS migration(name TEXT PRIMARY KEY);
    CREATE TABLE IF NOT EXISTS objects(kind TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(kind,id));
    CREATE TABLE IF NOT EXISTS events(owner TEXT,sequence INTEGER,payload TEXT NOT NULL,PRIMARY KEY(owner,sequence));
+   CREATE TABLE IF NOT EXISTS relation_identities(owner TEXT, fingerprint BLOB, payload TEXT NOT NULL, PRIMARY KEY(owner,fingerprint));
+   CREATE TABLE IF NOT EXISTS import_keys(owner TEXT, fingerprint BLOB, PRIMARY KEY(owner,fingerprint));
    CREATE TABLE IF NOT EXISTS intents(owner TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(owner,id));
   `);
   if(!db.prepare("SELECT 1 FROM migration WHERE name='complete'").get())await migrate(db,directory,key);
@@ -137,8 +139,43 @@ export async function saveDurableJob(directory,key,id,job){
 }
 export async function saveDurablePlan(directory,key,id,plan){await saveObject(directory,key,'plans',id,plan);}
 export async function saveDurablePayload(directory,key,id,payload){await saveObject(directory,key,'payloads',id,payload);}
+export async function importIdentityIndex(directory,key,jobId){
+ const db=await store(directory,key),owner=validId(jobId);
+ const query=db.prepare('SELECT payload FROM relation_identities WHERE owner=? AND fingerprint=?');
+ const save=db.prepare('INSERT INTO relation_identities VALUES (?,?,?) ON CONFLICT(owner,fingerprint) DO UPDATE SET payload=excluded.payload');
+ const fingerprint=id=>createHmac('sha256',key).update(id).digest();
+ return {
+  get(id){
+   const row=query.get(owner,fingerprint(id));
+   return row?open(JSON.parse(row.payload),key):undefined;
+  },
+  save(values){
+   transaction(db,()=>{for(const [id,value] of values)save.run(owner,fingerprint(id),JSON.stringify(envelope(value,key)));});
+  }
+ };
+}
+export async function clearImportIdentities(directory,key,jobId){
+ const db=await store(directory,key);
+ db.prepare('DELETE FROM relation_identities WHERE owner=?').run(validId(jobId));
+}
+
 export async function saveImportBatch(directory,key,inputId,index,batch){
- await saveObject(directory,key,'import-batches',inputId+':'+index,batch);
+ const db=await store(directory,key),owner=validId(inputId);
+ const reserve=db.prepare('INSERT OR IGNORE INTO import_keys VALUES (?,?)');
+ transaction(db,()=>{
+  for(const record of batch.entity.records){
+   const fields=[batch.targetId,batch.targetKey,String(record?.matchKey)];
+   const fingerprint=createHmac('sha256',key).update(JSON.stringify(fields)).digest();
+   if(!reserve.run(owner,fingerprint).changes){
+    throw Object.assign(Error('יותר מרשומת מקור אחת מופנית לאותו מפתח יעד: '+fields[2]),{status:422});
+   }
+  }
+  db.prepare('INSERT INTO objects VALUES (?,?,?)').run('import-batches',validId(owner+':'+index),JSON.stringify(envelope(batch,key)));
+ });
+}
+export async function clearImportKeys(directory,key,inputId){
+ const db=await store(directory,key);
+ db.prepare('DELETE FROM import_keys WHERE owner=?').run(validId(inputId));
 }
 export async function loadImportBatch(directory,key,inputId,index){
  const db=await store(directory,key);
@@ -213,6 +250,7 @@ async function remove(directory,kind,id){
   if(kind==='jobs'){
    db.prepare('DELETE FROM events WHERE owner=?').run(id);
    db.prepare('DELETE FROM intents WHERE owner=?').run(id);
+   db.prepare('DELETE FROM relation_identities WHERE owner=?').run(id);
   }
  });
 }
@@ -225,6 +263,7 @@ export async function deleteDurablePayload(directory,id){
  const prefix=validId(id)+':';
  transaction(db,()=>{
   db.prepare("DELETE FROM objects WHERE kind='payloads' AND id=?").run(id);
+  db.prepare('DELETE FROM import_keys WHERE owner=?').run(id);
   db.prepare("DELETE FROM objects WHERE kind='import-batches' AND id>=? AND id<?")
    .run(prefix,prefix.slice(0,-1)+';');
  });

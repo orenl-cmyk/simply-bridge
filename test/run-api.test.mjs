@@ -1,10 +1,17 @@
+import {indexImportFile,framedImportBody} from '../public/import-file.js';
 import {test} from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import {spawn} from 'node:child_process';import {mkdtemp,mkdir,readFile,writeFile,stat} from 'node:fs/promises';import path from 'node:path';import {fileURLToPath} from 'node:url';
 const loadRows=Number(process.env.BRIDGE_TEST_IMPORT_ROWS)||0;
 const root=fileURLToPath(new URL('../',import.meta.url));
 test('RUN creates, skips validation failure and continues; replay is idempotent; unknown writes survive restart and block repeats',async()=>{
- const rows=new Map(),writes=[];let serial=0,storedBeforeReply,dryProbe,dryReleased;const mock=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const b=JSON.parse(text);res.setHeader('content-type','application/json');if(req.url.includes('entity_structure'))return res.end(JSON.stringify({field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'title',field_type_name:'input-text'},{field_data_name:'external',field_type_name:'input-text'},{field_data_name:'link',field_type_name:'select-from-entity'},{field_data_name:'relation_json',field_type_name:'textarea'}]]}]}));if(req.url.includes('instance_data')){const value=b.filter[0][2];if(['dry-restart0','compact-second0'].includes(value)&&dryProbe){const started=dryProbe;dryProbe=null;started();await dryReleased;}if(b.filter[0][1]==='in'){const matches=[...new Set(value)].flatMap(k=>rows.has(k)?[rows.get(k)]:[]);return res.end(JSON.stringify({info:{total_count:matches.length},data:matches.map(instance_data=>({instance_data}))}));}const r=b.filter[0][0]==='_id'?[...rows.values()].find(row=>row._id===value):rows.get(value);return res.end(JSON.stringify({info:{total_count:r?1:0},data:r?[{instance_data:r}]:[]}));}
+ const rows=new Map(),writes=[];let serial=0,storedBeforeReply,dryProbe,dryReleased,repairStored,releaseRepair;const mock=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const b=JSON.parse(text);res.setHeader('content-type','application/json');if(req.url.includes('entity_structure'))return res.end(JSON.stringify({field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'title',field_type_name:'input-text'},{field_data_name:'external',field_type_name:'input-text'},{field_data_name:'link',field_type_name:'select-from-entity'},{field_data_name:'relation_json',field_type_name:'textarea'}]]}]}));if(req.url.includes('instance_data')){const value=b.filter[0][2];if(['dry-restart0','pipeline-third0','compact-second0'].includes(value)&&dryProbe){const started=dryProbe;dryProbe=null;started();await dryReleased;}if(b.filter[0][1]==='in'){const matches=[...new Set(value)].flatMap(k=>rows.has(k)?[rows.get(k)]:[]);return res.end(JSON.stringify({info:{total_count:matches.length},data:matches.map(instance_data=>({instance_data}))}));}const r=b.filter[0][0]==='_id'?[...rows.values()].find(row=>row._id===value):rows.get(value);return res.end(JSON.stringify({info:{total_count:r?1:0},data:r?[{instance_data:r}]:[]}));}
  writes.push({url:req.url,body:b});const form=b.form_data?.[0]?.data[0];if(form?.title==='slow')await new Promise(r=>setTimeout(r,50));if(form?.title==='bad')return res.end(JSON.stringify({error:{type:'validation',column:[{field_data_name:'title',message:'invalid value'}]}}));if(form?.title==='timeout'){req.socket.destroy();return;}
- if(req.url.includes('create_instance')){const id='created-'+(++serial);rows.set(form.external,{_id:id,field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:form.external}]]}]});if(form.title==='restart after write'){rows.get(form.external).field_groups[0].fields_data[0].push({field_data_name:'title',value:form.title});storedBeforeReply();await new Promise(r=>setTimeout(r,500));}return res.end(JSON.stringify({success:'ok',results:{_id:id}}));}const updated=[...rows.values()].find(row=>row._id===b.filter?.[0]?.[2]);if(updated&&b.field){for(const [field_data_name,value] of b.field){const fields=updated.field_groups[0].fields_data[0];const cell=fields.find(field=>field.field_data_name===field_data_name);if(cell)cell.value=value;else fields.push({field_data_name,value});}}res.end(JSON.stringify({success:'ok',results:{instances_updated:1}}));});await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+ if(req.url.includes('create_instance')){const id='created-'+(++serial);rows.set(form.external,{_id:id,field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:form.external}]]}]});if(form.title==='restart after write'){rows.get(form.external).field_groups[0].fields_data[0].push({field_data_name:'title',value:form.title});storedBeforeReply();await new Promise(r=>setTimeout(r,500));}return res.end(JSON.stringify({success:'ok',results:{_id:id}}));}const updated=[...rows.values()].find(row=>row._id===b.filter?.[0]?.[2]);if(updated&&b.field){for(const [field_data_name,value] of b.field){const fields=updated.field_groups[0].fields_data[0];const cell=fields.find(field=>field.field_data_name===field_data_name);if(cell)cell.value=value;else fields.push({field_data_name,value});}}if(repairStored&&b.field?.some(([field,value])=>field==='link'&&value==='replacement')){
+  const settled=repairStored;
+  repairStored=null;
+  settled();
+  await releaseRepair;
+ }
+ res.end(JSON.stringify({success:'ok',results:{instances_updated:1}}));});await new Promise(r=>mock.listen(0,'127.0.0.1',r));
  const work=path.resolve(root,'../../work');await mkdir(work,{recursive:true});const data=await mkdtemp(path.join(work,'run-test-')),port=4342,origin=`http://127.0.0.1:${port}`;let child,cookie='',extraEnv={};
  const keyFile=path.join(data,'service-key');await writeFile(keyFile,Buffer.alloc(32,42),{mode:0o600});
  const launch=async()=>{child=spawn(process.execPath,['--preserve-symlinks','--preserve-symlinks-main',path.join(root,'server.mjs')],{env:{...process.env,PORT:String(port),DATA_DIR:data,BRIDGE_RECOVERY_KEY_FILE:keyFile,...extraEnv},stdio:['ignore','pipe','pipe'],windowsHide:true});await new Promise((r,j)=>{child.stdout.once('data',r);child.once('error',j);child.once('exit',()=>j(Error('server stopped')));});};
@@ -73,11 +80,14 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  let releaseSecond;
  dryReleased=new Promise(resolve=>{releaseSecond=resolve;});
  await call('schema/structure',{connectionId:c,entityId:'appUsers'});
- const compactBody=new Blob([
-  JSON.stringify({connectionId:c,schemaVersion:'1.0'})+'\n',
-  JSON.stringify({...relationMapping,entity:entity(['first'],'compact-first')})+'\n',
-  JSON.stringify({...relationMapping,entity:entity(['second'],'compact-second')})+'\n'
- ],{type:'application/x-ndjson'});
+ const file=new Blob([JSON.stringify({meta:{schemaVersion:'1.0'},entities:{
+  first:entity(['first'],'compact-first'),second:entity(['second'],'compact-second')
+ }},null,2)]);
+ const indexed=await indexImportFile(file,1);
+ const descriptors=Object.entries(indexed.batches).flatMap(([name,ranges])=>ranges.map(range=>({
+  file,range,mapping:{...relationMapping,entity:indexed.entities[name]}
+ })));
+ const compactBody=framedImportBody({connectionId:c,schemaVersion:'1.0'},descriptors);
  const compactImport=await call('import/pipeline/start',compactBody);
  assert.equal(compactImport.status,202);
  await secondBatchStarted;
@@ -120,7 +130,9 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
    sampledPeakDiskBytes:peakBytes,serverPeakRssKiB:Number(memory?.match(/^VmHWM:\s+(\d+)/m)?.[1])||null}));
  }
  const rulesFile=path.join(data,'relation-rules.json');
- await writeFile(rulesFile,JSON.stringify({[c]:[{sourceEntity:'users',sourceRelatedEntity:'users',groupId:'g',fieldId:'link',targetEntity:'appUsers',valueMode:'sourceText',targetKey:{kind:'field',groupId:'g',fieldId:'external'}}]}));
+ const linkRule={sourceEntity:'users',sourceRelatedEntity:'users',groupId:'g',fieldId:'link',
+  targetEntity:'appUsers',valueMode:'sourceText',targetKey:{kind:'field',groupId:'g',fieldId:'external'}};
+ await writeFile(rulesFile,JSON.stringify({[c]:[linkRule,{...linkRule,sourceEntity:'otherUsers'}]}));
  extraEnv={BRIDGE_RELATION_RULES_FILE:rulesFile};
  await stop();
  await launch();
@@ -129,8 +141,26 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const later=entity(['first','second'],'pipeline');
  later.records[0].data.g[0].link={instance_id:'source1',text:'unusable as a lookup'};
  const batches=later.records.map(record=>({...relationMapping,entity:{...later,records:[record]}}));
+ await call('schema/structure',{connectionId:c,entityId:'otherDestination'});
+ const third=entity(['third'],'pipeline-third');
+ third.meta.dataName='otherUsers';
+ third.records[0].data.g[0].link={instance_id:'source0',text:'unusable as a lookup'};
+ batches.push({...relationMapping,entity:third,targetId:'otherDestination'});
+ const thirdStarted=new Promise(resolve=>{dryProbe=resolve;});
+ let releaseThird;
+ dryReleased=new Promise(resolve=>{releaseThird=resolve;});
  const pipeline=await call('import/pipeline/start',{connectionId:c,schemaVersion:'1.0',batches});
  assert.equal(pipeline.status,202);
+ await thirdStarted;
+ const activePipeline=(await call('jobs/detail',{jobId:pipeline.jobId})).job;
+ assert.equal(activePipeline.state,'running');
+ assert.equal(activePipeline.planIds.length,0);
+ assert.equal(activePipeline.relationCompleted,2);
+ await stop();
+ releaseThird();
+ cookie='';
+ await launch();
+ await call('unlock',{username:'admin',password:'test-password-123'});
  let pipelineStatus;
  for(let i=0;i<100;i++){
   pipelineStatus=await call('import/run/status',{jobId:pipeline.jobId});
@@ -148,8 +178,10 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  assert.ok(cleanedJob.cleanedAt);
  assert.equal(cleanedJob.inputId,undefined);
  assert.deepEqual(cleanedJob.planIds,[]);
- assert.equal(cleanedJob.counts.succeeded,2);
+ assert.equal(cleanedJob.counts.succeeded,3);
+ assert.equal(rows.get('pipeline-third0').field_groups[0].fields_data[0].find(field=>field.field_data_name==='link')?.value,rows.get('pipeline0')._id);
  assert.equal(rows.get('pipeline0').field_groups[0].fields_data[0].find(field=>field.field_data_name==='link')?.value,rows.get('pipeline1')._id);
+ await call('schema/structure',{connectionId:c,entityId:'appUsers'});
  const missing=entity(['missing relation'],'repair');
  missing.records[0].data.g[0].link={instance_id:'not-exported',text:'repair key'};
  const needsRepair=await call('import/pipeline/start',{connectionId:c,schemaVersion:'1.0',batches:[{...relationMapping,entity:missing}]});
@@ -164,12 +196,22 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const repairRequest={jobId:needsRepair.jobId,groupId:group.groupId};
  assert.equal((await call('repairs/retry-relations',{...repairRequest,mapping:null})).status,422);
  const correctedMapping={sourceRelatedEntity:'users',targetEntity:'appUsers',targetGroup:'g',targetField:'external',valueMode:'sourceText'};
+ const repairWritten=new Promise(resolve=>{repairStored=resolve;});
+ let unblockRepair;
+ releaseRepair=new Promise(resolve=>{unblockRepair=resolve;});
  assert.equal((await call('repairs/retry-relations',{...repairRequest,mapping:correctedMapping})).status,202);
+ await repairWritten;
+ await stop();
+ unblockRepair();
+ cookie='';
+ await launch();
+ await call('unlock',{username:'admin',password:'test-password-123'});
  for(let i=0;i<100;i++){
   if((await call('import/run/status',{jobId:needsRepair.jobId})).state==='done')break;
   await new Promise(resolve=>setTimeout(resolve,25));
  }
  assert.equal((await call('import/run/status',{jobId:needsRepair.jobId})).relationIssueCount,0);
+ assert.equal(writes.filter(write=>write.body.field?.some(([field,value])=>field==='link'&&value==='replacement')).length,1);
  assert.equal(rows.get('repair0').field_groups[0].fields_data[0].find(field=>field.field_data_name==='link')?.value,'replacement');
  assert.equal((await call('jobs/close-relations',{jobId:needsRepair.jobId})).status,200);
  const blackConfigFile=path.join(data,'black-config.json'),blackTokenFile=path.join(data,'black-token');

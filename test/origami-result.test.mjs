@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {classifyOrigamiResult} from '../origami-result.mjs';
 import {executeRow} from '../run.mjs';
-import {rateState} from '../rate-limit.mjs';
+import {rateState,rateSnapshot,restoreEnvironmentRate} from '../rate-limit.mjs';
 
 test('HTTP 200 max_api_calls is a rate limit and pauses a row without recording a permanent failure',async()=>{
  const classified=classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'max_api_calls',message:'Hourly quota reached'}}});
@@ -33,4 +33,15 @@ test('connections targeting the same environment share the strictest observed qu
  assert.equal(second.effectiveRps,6);
  assert.equal(second.configuredHourly,300);
  assert.notEqual(first,other);
+});
+
+test('restart restores observed quota and backoff across connections to the environment',()=>{
+ const baseUrl='https://recovered.invalid';
+ const capturedAt=Date.now()-1000;
+ restoreEnvironmentRate({id:'before',baseUrl,maxRequestsPerHour:10},{capturedAt,hourlyUsed:9,effectiveRps:2,pausedMs:5000});
+ const snapshot=rateSnapshot({id:'after',baseUrl,maxRequestsPerHour:10});
+ assert.equal(snapshot.hourlyUsed,9);
+ assert.equal(snapshot.hourlyRemaining,1);
+ assert.equal(snapshot.effectiveRps,2);
+ assert.ok(snapshot.pausedMs>0);
 });

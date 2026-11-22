@@ -15,9 +15,9 @@ import {readOrigami,normalizeEntities,normalizeStructure,excludedEntity} from '.
 import {exportEntity,createPackage} from './transfer.mjs';
 import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
 import {writeSimply,executeRow} from './run.mjs';
-import {rateSnapshot,rateEtaSeconds,setConnectionRateCap,environmentKey} from './rate-limit.mjs';
+import {rateSnapshot,rateEtaSeconds,setConnectionRateCap,environmentKey,restoreEnvironmentRate} from './rate-limit.mjs';
 import {validatePreset} from './presets.mjs';
-import {saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
+import {importIdentityIndex,clearImportIdentities,clearImportKeys,saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const appVersion=JSON.parse(await readFile(path.join(root,'package.json'),'utf8')).version;
@@ -97,9 +97,61 @@ async function* importLines(req){
  }finally{lines.close();}
 }
 
+async function* framedImport(req){
+ const chunks=req[Symbol.asyncIterator]();
+ let buffer=Buffer.alloc(0);
+ const refill=async()=>{
+  const {value,done}=await chunks.next();
+  if(done){buffer=Buffer.alloc(0);return false;}
+  buffer=value;
+  return true;
+ };
+ const line=async()=>{
+  const parts=[];
+  for(;;){
+   if(!buffer.length&&!await refill()){
+    if(parts.length)throw fail(400,'כותרת אצווה לא הושלמה.');
+    return null;
+   }
+   const end=buffer.indexOf(10);
+   if(end>=0){
+    parts.push(buffer.subarray(0,end));
+    buffer=buffer.subarray(end+1);
+    return Buffer.concat(parts).toString('utf8');
+   }
+   parts.push(buffer);
+   buffer=Buffer.alloc(0);
+  }
+ };
+ const body=async size=>{
+  const parts=[];
+  while(size){
+   if(!buffer.length&&!await refill())throw fail(400,'אצוות ייבוא לא הושלמה.');
+   const length=Math.min(size,buffer.length);
+   parts.push(buffer.subarray(0,length));
+   buffer=buffer.subarray(length);
+   size-=length;
+  }
+  return Buffer.concat(parts).toString('utf8');
+ };
+ const parse=text=>{
+  try{return JSON.parse(text);}catch{throw fail(400,'לא ניתן לקרוא את אצוות הייבוא.');}
+ };
+ try{
+  yield parse(await line());
+  for(let header=await line();header!==null;header=await line()){
+   const {bytes,mapping}=parse(header)||{};
+   if(!Number.isSafeInteger(bytes)||bytes<1||!mapping?.entity)throw fail(400,'כותרת אצווה לא תקינה.');
+   mapping.entity.records=parse('['+await body(bytes)+']');
+   yield mapping;
+  }
+ }finally{await chunks.return?.();}
+}
+
 async function pipelineRequest(req){
- if(req.headers['content-type']?.split(';')[0]==='application/x-ndjson'){
-  const batches=importLines(req);
+ const type=req.headers['content-type']?.split(';')[0];
+ if(type==='application/x-ndjson'||type==='application/x-bridge-batches'){
+  const batches=type==='application/x-ndjson'?importLines(req):framedImport(req);
   const {value:header}=await batches.next();
   return {header,batches};
  }
@@ -127,11 +179,12 @@ async function hydrateDurable(s,{recover=false}={}){
    for(const event of events())if(event.type==='retry'){
     job.retries??={};
     if(activeRow(event.key))job.retries[event.key]=event.retry;
+    if(event.rateLimit?.capturedAt>(job.rateLimit?.capturedAt||0))job.rateLimit=event.rateLimit;
    }
    const cache=new Map();
    for(const event of events())if(event.type==='relation-close')job.relationsClosedAt=event.at;
    if(job.relationsClosedAt)closedCaches.push('cache-'+id);
-   else{
+   else if(!job.relationBatchPlans){
     for(const event of reader.events('cache-'+id))cache.set(event.key,event.candidates);
     if(cache.size)jobRelationCache.set(id,cache);
    }
@@ -149,7 +202,7 @@ async function hydrateDurable(s,{recover=false}={}){
     if(event.type==='relation-intent')job.relationInFlight=event.cursor;
     if(event.type==='relation-progress'){
      job.relationInFlight=null;
-     if(event.taskId)completedRelations.add(event.taskId);
+     if(event.taskId&&activeRow(event.taskId))completedRelations.add(event.taskId);
      job.relationCompleted++;
      if(event.issues.length)job.relationIssues.push(...event.issues);
     }
@@ -217,6 +270,23 @@ async function blackIssueApi(req,res,url){
  }finally{key.fill(0);}
 }
 
+const restoredEnvironments=new Set();
+function restoreJobRates(connections){
+  const snapshots=new Map();
+  for(const job of backgroundJobs.values()){
+   const connection=connections.find(item=>item.id===job.connectionId);
+   if(!connection||!job.rateLimit?.capturedAt)continue;
+   const environment=environmentKey(connection);
+   if((snapshots.get(environment)?.capturedAt||0)<job.rateLimit.capturedAt)snapshots.set(environment,job.rateLimit);
+  }
+  for(const connection of connections){
+   const environment=environmentKey(connection);
+   if(restoredEnvironments.has(environment))continue;
+   restoreEnvironmentRate(connection,snapshots.get(environment));
+   restoredEnvironments.add(environment);
+  }
+}
+
 async function recoverBackgroundImports(){
  if(!serviceKey)return;
  const key=await loadRecoveryKey(directory,serviceKey);
@@ -225,6 +295,7 @@ async function recoverBackgroundImports(){
   const storedVault=await envelope();
   const data=decrypt(storedVault,key);
   await hydrateDurable({key},{recover:true});
+  restoreJobRates(data.connections);
   for(const [id,job] of backgroundJobs){
    if(job.type==='black_issue'&&['queued','running'].includes(job.state)){
     const target=data.connections.find(c=>c.id===job.connectionId&&c.updatedAt===job.connectionVersion);
@@ -326,6 +397,18 @@ function launchDryPreparation(jobId,job,session,connection){
  void runDryPreparation(jobId,job,session,connection).catch(()=>console.error('Dry Run checkpoint failed',jobId));
 }
 
+async function verifyImportWrite({connection,entity,plan,relationData,guard,onDebug,attempts}){
+ let latest;
+ for(let attempt=0;attempt<attempts;attempt++){
+  if(attempt)await new Promise(resolve=>setTimeout(resolve,250*2**(attempt-1)));
+  const checked=await dryRunEntity({connection,entity,targetId:plan.targetId,targetKey:plan.targetKey,
+   schema:plan.schema,relationData,guard,onDebug});
+  latest=checked.rows[0];
+  if(latest?.status==='skipped'&&latest.targetId)break;
+ }
+ return latest;
+}
+
 async function executePlanRow(s,b,guard=()=>{}){
  const plan=runtimePlans.get(b.planId),index=b.index;
  if(!plan||plan.ownerId!==s.userId||!Number.isInteger(index)||index<0||index>=plan.entity.records.length)throw fail(422,'בדיקת הייבוא פגה או שהרשומה אינה תקינה. בצעו Dry Run חדש.');
@@ -337,8 +420,7 @@ async function executePlanRow(s,b,guard=()=>{}){
   if(serviceKey&&s.durableJobId){
    try{
     const entity={...plan.entity,records:[plan.entity.records[index]]};
-    const checked=await dryRunEntity({connection:c,entity,targetId:plan.targetId,targetKey:plan.targetKey,schema:plan.schema,relationData:plan.relationData,guard});
-    const fresh=checked.rows[0];
+    const fresh=await verifyImportWrite({connection:c,entity,plan,relationData:plan.relationData,guard,attempts:3});
     if(fresh.status==='skipped'&&fresh.targetId){
      interrupted.status='succeeded';
      interrupted.targetId=fresh.targetId;
@@ -381,7 +463,9 @@ async function executePlanRow(s,b,guard=()=>{}){
  runtimeOutcomes.set(id,entry);await mutateVault(s,next=>{next.importLog??=[];const i=next.importLog.findIndex(x=>x.id===id);if(row.status==='succeeded'){if(i>=0)next.importLog.splice(i,1);return;}if(i<0)next.importLog.push(entry);else next.importLog[i]=entry;});};
  let debug;const write=(r,step)=>writeSimply(c,step.operation,step.body,d=>debug=d,guard);
  const reconcile=async({completed,error})=>{
-  const entity={...plan.entity,records:[plan.entity.records[index]]},checked=await dryRunEntity({connection:c,entity,targetId:plan.targetId,targetKey:plan.targetKey,schema:plan.schema,relationData:effectiveRelationData,guard,onDebug:d=>debug=d}),fresh=checked.rows[0];
+  const entity={...plan.entity,records:[plan.entity.records[index]]};
+  const fresh=await verifyImportWrite({connection:c,entity,plan,relationData:effectiveRelationData,
+   guard,onDebug:d=>{debug=d;},attempts:error.kind==='uniqueness'?1:3});
   if(fresh.status==='skipped')return {sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:fresh.targetId||planned.targetId,status:'succeeded',sent:true,stop:false,reconciled:true,reconciliation:'הכתיבה נמצאה ביעד לאחר תשובה לא ידועה.',completedRequests:completed,warnings:planned.warnings};
   if(error.kind==='uniqueness'){
    return {sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,
@@ -418,7 +502,8 @@ async function runBackgroundImport(jobId,s,{finalize=true}={}){
      retry.nextAt=Date.now()+Math.max(1000*2**retry.attempt,row.error.pauseMs||0);
      job.retries??={};
      job.retries[item.key]=retry;
-     await appendDurableEvent(directory,worker.key,jobId,{type:'retry',key:item.key,retry});
+     job.rateLimit=rateSnapshot(connection);
+     await appendDurableEvent(directory,worker.key,jobId,{type:'retry',key:item.key,retry,rateLimit:job.rateLimit});
      readyAgain.push(item);
      continue;
     }
@@ -468,7 +553,7 @@ async function retryRelationGroup(jobId,job,command,connection,key){
  const {group,items,choices,rules,mappingOverride,actor}=command;
  try{
   const input=runtimeInputs.get(job.inputId);
-  const identities=indexImportIdentities(job.planIds.map(id=>[id,runtimePlans.get(id)]),runtimeOutcomes);
+  const identities=job.relationBatchPlans?await importIdentityIndex(directory,key,jobId):indexImportIdentities(job.planIds.map(id=>[id,runtimePlans.get(id)]),runtimeOutcomes);
   const finalize=createRelationFinalizer({connection,rules,identities,schemas:new Map(input.schemas)});
   for(let index=command.next;index<items.length;index++){
    const item=items[index];
@@ -495,6 +580,12 @@ async function retryRelationGroup(jobId,job,command,connection,key){
  }
 }
 
+function importOutcome(job){
+ if(job.state==='done')return hasImportGaps(job)?'completed_with_gaps':'completed';
+ if(job.state==='paused'&&!['restart','rate_limit'].includes(job.pauseKind))return 'needs_attention';
+ return job.state;
+}
+
 function reportPipelineProgress(job,active){
  const progress={...job.progress};
  const records=Number(progress.checkTotal)||0;
@@ -513,15 +604,22 @@ function reportPipelineProgress(job,active){
  return progress;
 }
 
-function pipelineRelationWorker(jobId,job,worker,input){
- const identities=new Map(),tasks=new Map(),waiting=new Map(),ready=[];
+async function pipelineRelationWorker(jobId,job,worker,input){
+ const durable=Boolean(job.relationBatchPlans);
+ const identities=durable?await importIdentityIndex(directory,worker.key,jobId):new Map();
+ const tasks=new Map(),waiting=new Map(),ready=[],unprocessed=new Map(),retirable=new Set();
  const completed=completedRelationTasks.get(jobId)||new Set();
  completedRelationTasks.set(jobId,completed);
- const cache=jobRelationCache.get(jobId)||new Map();
- jobRelationCache.set(jobId,cache);
+ const cacheIndex=durable?await importIdentityIndex(directory,worker.key,'cache-'+jobId):null;
+ const cache=cacheIndex?{
+  has:key=>cacheIndex.get(key)!==undefined,
+  get:key=>cacheIndex.get(key),
+  set:(key,value)=>cacheIndex.save([[key,value]])
+ }:jobRelationCache.get(jobId)||new Map();
+ if(!durable)jobRelationCache.set(jobId,cache);
  const connection=worker.data.connections.find(c=>c.id===job.connectionId);
  const finalize=createRelationFinalizer({connection,rules:input.finalizerRules,identities,schemas:new Map(input.schemas),cache,
-  onCache:(key,candidates)=>appendDurableEvent(directory,worker.key,'cache-'+jobId,{type:'relation-cache',key,candidates})
+  onCache:durable?undefined:(key,candidates)=>appendDurableEvent(directory,worker.key,'cache-'+jobId,{type:'relation-cache',key,candidates})
  });
  const remaining=new Map();
  const sourceDependency=name=>JSON.stringify(['source',name]);
@@ -537,10 +635,14 @@ function pipelineRelationWorker(jobId,job,worker,input){
  ]));
  let previousAt=Date.now(),rate=0;
  const register=index=>{
-  const planId=job.planIds[index],plan=runtimePlans.get(planId);
-  if(!plan)throw Error('תוכנית הייבוא הדרושה להשלמת קישורים אינה זמינה.');
-  for(const [key,value] of indexImportIdentities([[planId,plan]],runtimeOutcomes))identities.set(key,value);
-  const source=plan.sourceEntity.meta.dataName;
+  const planId=durable?job.relationBatchPlans[index]:job.planIds[index];
+  const plan=runtimePlans.get(planId);
+  if(planId&&!plan)throw Error('תוכנית הייבוא הדרושה להשלמת קישורים אינה זמינה.');
+  if(plan){
+   const mapped=indexImportIdentities([[planId,plan]],runtimeOutcomes);
+   if(durable)identities.save(mapped);
+   else for(const [key,value] of mapped)identities.set(key,value);
+  }
   for(const dependency of batchDependencies(input.batches[index])){
    remaining.set(dependency,remaining.get(dependency)-1);
    if(remaining.get(dependency)!==0)continue;
@@ -550,7 +652,10 @@ function pipelineRelationWorker(jobId,job,worker,input){
    }
    waiting.delete(dependency);
   }
-  if(!plan.relationStaging)return;
+  if(!plan)return;
+  if(!plan.relationStaging){retirable.add(planId);return;}
+  const source=plan.sourceEntity.meta.dataName;
+  unprocessed.set(planId,0);
   const {groupId,fieldId}=plan.relationStaging;
   for(const [recordIndex,record] of plan.entity.records.entries()){
    const taskId=planId+':'+recordIndex;
@@ -567,12 +672,14 @@ function pipelineRelationWorker(jobId,job,worker,input){
    }
    const task={taskId,planId,plan,record,envelope,dependencies};
    tasks.set(taskId,task);
+   unprocessed.set(planId,unprocessed.get(planId)+1);
    for(const dependency of dependencies){
     if(!waiting.has(dependency))waiting.set(dependency,[]);
     waiting.get(dependency).push(task);
    }
    if(!dependencies.size)ready.push(task);
   }
+  if(!unprocessed.get(planId))retirable.add(planId);
  };
  const drain=async()=>{
   if(job.stopRequested||(!ready.length&&!job.relationInFlight))return;
@@ -598,17 +705,34 @@ function pipelineRelationWorker(jobId,job,worker,input){
    job.relationInFlight=null;
    completed.add(taskId);
    tasks.delete(taskId);
-   job.relationCompleted=completed.size;
+   job.relationCompleted=(job.relationCompleted||0)+1;
+   const outstanding=unprocessed.get(planId)-1;
+   unprocessed.set(planId,outstanding);
+   if(!outstanding)retirable.add(planId);
    const now=Date.now(),sample=1000/Math.max(1,now-previousAt);
    rate=rate?0.85*rate+0.15*sample:sample;
    previousAt=now;
-   job.progress.relationEtaSeconds=completed.size>=3?Math.ceil((job.progress.relationsTotal-completed.size)/rate):null;
+   job.progress.relationEtaSeconds=job.relationCompleted>=3?Math.ceil((job.progress.relationsTotal-job.relationCompleted)/rate):null;
    job.progress.lastProgressAt=now;
    if(issues.length)(job.relationIssues??=[]).push(...issues);
   }
   ready.length=0;
  };
- return {register,drain};
+ async function prune(){
+  if(!durable)return;
+  for(const planId of retirable){
+   if(job.relationIssues?.some(issue=>issue.planId===planId)||!retireCleanBatch(job,planId))continue;
+   const batchIndex=Object.keys(job.relationBatchPlans).find(index=>job.relationBatchPlans[index]===planId);
+   delete job.relationBatchPlans[batchIndex];
+   await storeJob(jobId,job,worker.key);
+   const count=runtimePlans.get(planId)?.entity.records.length||0;
+   for(let index=0;index<count;index++)completed.delete(planId+':'+index);
+   unprocessed.delete(planId);
+   await deleteRetiredPlan(job,worker.key);
+  }
+  retirable.clear();
+ }
+ return {register,drain,prune};
 }
 async function cleanupSuccessfulPipeline(jobId,job,key){
  const pending=job.cleanupPending??{inputId:job.inputId,planIds:job.planIds};
@@ -635,6 +759,7 @@ async function cleanupSuccessfulPipeline(jobId,job,key){
  jobRelationCache.delete(jobId);
  completedRelationTasks.delete(jobId);
  await deleteDurableJob(directory,'cache-'+jobId);
+ await clearImportIdentities(directory,key,jobId);
  delete job.cleanupPending;
  job.cleanedAt=Date.now();
  await storeJob(jobId,job,key);
@@ -654,7 +779,7 @@ async function deleteRetiredPlan(job,key){
 }
 
 function retireCleanBatch(job,planId){
- if(!job.compactBatches||job.rows.some(row=>row.planId===planId))return;
+ if(!job.compactBatches||job.rows.some(row=>row.planId===planId))return false;
  const prefix=planId+':';
  const retired=job.order.filter(item=>item.planId===planId).length;
  job.baseCounts.succeeded+=retired;
@@ -664,14 +789,16 @@ function retireCleanBatch(job,planId){
  job.planIds=job.planIds.filter(id=>id!==planId);
  job.completedKeys=job.completedKeys.filter(id=>!id.startsWith(prefix));
  job.retiredPlan=planId;
+ return true;
 }
 
 async function runImportPipeline(jobId,s){
  const job=backgroundJobs.get(jobId),input=job&&runtimeInputs.get(job.inputId);if(!job||!input||job.pipelineWorkerActive)return;job.pipelineWorkerActive=true;const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),schemas:new Map(s.schemas)};worker.schemas.set(job.connectionId+':'+job.connectionVersion,new Map(input.schemas||[]));try{
-  const relations=input.finalizerRules?pipelineRelationWorker(jobId,job,worker,input):null;
+  const relations=input.finalizerRules?await pipelineRelationWorker(jobId,job,worker,input):null;
   if(relations){
    for(let index=0;index<job.nextBatch;index++)relations.register(index);
    await relations.drain();
+   await relations.prune();
   }
   while(job.nextBatch<input.batches.length&&job.state==='running'&&!job.stopRequested){
    const mapping=job.segmentedInput?await loadImportBatch(directory,worker.key,job.inputId,job.nextBatch):input.batches[job.nextBatch];
@@ -680,14 +807,16 @@ async function runImportPipeline(jobId,s){
    if(job.preparedBatch!==job.nextBatch){job.progress.phase='checking';job.progress.activeBatch=job.nextBatch+1;await storeJob(jobId,job,worker.key);const prepared=await buildImportPreparation({s:worker,c:connection,b:{schemaVersion:input.schemaVersion,mappings:[mapping],rules:input.rules||[]},guard:()=>{},onDebug:d=>job.debug=d,onProgress:p=>{job.progress.checked=job.checkedBeforeBatch+Number(p.records||0);}});job.planIds.push(...prepared.plans.map(p=>p.id));job.order.push(...prepared.order.map(({planId,index})=>({planId,index})));job.progress.checked=job.checkedBeforeBatch+mapping.entity.records.length;job.checkedBeforeBatch=job.progress.checked;job.baseProgress.checked=job.progress.checked;job.baseProgress.total=job.baseProgress.completed+job.order.length;job.baseProgress.apiRequestsTotal=job.baseProgress.apiRequestsCompleted+job.order.reduce((sum,item)=>sum+(runtimePlans.get(item.planId)?.result?.rows?.[item.index]?.requests?.length||1),0);job.progress.total=job.baseProgress.total;job.progress.apiRequestsTotal=job.baseProgress.apiRequestsTotal;const rows=prepared.plans.flatMap(p=>p.result.rows);job.baseCounts.input+=rows.length;job.baseCounts.planned+=prepared.order.length;job.baseCounts.skipped+=rows.filter(r=>r.status==='skipped').length;job.baseCounts.blocked+=rows.filter(r=>r.status==='blocked').length;for(const key of ['input','planned','skipped','blocked'])job.counts[key]=job.baseCounts[key];job.preparedBatch=job.nextBatch;job.progress.phase='writing';await storeJob(jobId,job,worker.key);}
    await runBackgroundImport(jobId,worker,{finalize:false});
    if(job.state!=='running'||job.stopRequested)break;
+   if(job.relationBatchPlans)job.relationBatchPlans[job.nextBatch]=job.planIds.at(-1);
    relations?.register(job.nextBatch);
-   retireCleanBatch(job,job.planIds.at(-1));
+   if(!relations)retireCleanBatch(job,job.planIds.at(-1));
    job.nextBatch++;
    job.preparedBatch=null;
    await storeJob(jobId,job,worker.key);
    if(job.retiredPlan)await deleteRetiredPlan(job,worker.key);
    if(job.segmentedInput)await deleteImportBatch(directory,job.inputId,job.nextBatch-1);
    await relations?.drain();
+   await relations?.prune();
   }
   if(job.state==='running'){job.state=job.stopRequested?'stopped':hasImportGaps(job)?'completed_with_gaps':'done';job.progress={...job.progress,phase:'complete',percent:100,etaSeconds:0};job.finishedAt=Date.now();}await storeJob(jobId,job,worker.key);
   if(job.state==='done'&&!job.pendingRelationRepair&&!relationRepairWorkers.has(jobId)){
@@ -744,7 +873,7 @@ async function api(req,res,url){
  const method=req.method;
  if(['/api/issues/resolve','/api/issues/status'].includes(url))return blackIssueApi(req,res,url);
  const contentType=req.headers['content-type']?.split(';')[0];
- const isPipelineStream=url==='/api/import/pipeline/start'&&contentType==='application/x-ndjson';
+ const isPipelineStream=url==='/api/import/pipeline/start'&&['application/x-ndjson','application/x-bridge-batches'].includes(contentType);
  if(method!=='GET'&&(req.headers.origin!==origin||(contentType!=='application/json'&&!isPipelineStream)))throw fail(403,'בקשה ממקור לא מורשה.');
  if(url==='/api/status'&&method==='GET'){let unlocked=false,currentUser=null;try{const current=auth(req,false);unlocked=true;currentUser={username:current.username,role:current.role};}catch{}const e=await envelope(),users=await userStore();return send(res,200,{initialized:!!e,accountsInitialized:!!users,migrationRequired:!!e&&!users,unlocked,currentUser});}
  if(['/api/setup','/api/unlock'].includes(url)&&method==='POST'){
@@ -760,7 +889,7 @@ async function api(req,res,url){
    if(!store){key=derive(b.password,salt);try{data=decrypt(e,key);}catch{key.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}const master=randomBytes(32);user={id:randomUUID(),...identity,role:'admin',wrap:wrapMaster(master,b.password),createdAt:new Date().toISOString()};await persist(data,master,salt);await saveUsers({version:1,users:[user]});key.fill(0);key=master;}
    else{user=store.users.find(x=>x.normalized===identity.normalized);if(!user)throw fail(401,'שם המשתמש או הסיסמה שגויים.');try{key=unwrapMaster(user,b.password);data=decrypt(e,key);}catch{key?.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}}
   }
-  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};await hydrateDurable(current);if(blackConfig&&current.role==='admin')await saveRecoveryKey(directory,serviceKey,key);sessions.set(current.token,current);
+  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};await hydrateDurable(current);restoreJobRates(data.connections);if(blackConfig&&current.role==='admin')await saveRecoveryKey(directory,serviceKey,key);sessions.set(current.token,current);
   return send(res,200,publicData(current),{'Set-Cookie':`${cookieName}=${current.token}; HttpOnly; SameSite=Strict; Path=${cookiePath}${secureCookie}`});
  }
  const s=auth(req,url!=='/api/jobs');
@@ -999,7 +1128,8 @@ async function api(req,res,url){
    if(!req.complete||!checkTotal)throw fail(422,'לא התקבלה חבילת ייבוא שלמה.');
    const baseProgress={phase:'starting',checked:0,checkTotal,completed:0,total:0,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:0};
    const baseCounts={input:0,planned:0,skipped:0,blocked:0,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0};
-   job={type:'import_run',pipeline:true,segmentedInput:true,compactBatches:!input.finalizerRules,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};
+   job={type:'import_run',pipeline:true,segmentedInput:true,compactBatches:true,relationBatchPlans:input.finalizerRules?{}:undefined,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};
+   await clearImportKeys(directory,s.key,inputId);
    await saveDurablePayload(directory,s.key,inputId,input);
    await startDurableImport(jobId,job,s);
   }catch(error){await deleteDurablePayload(directory,inputId);throw error;}
@@ -1007,12 +1137,18 @@ async function api(req,res,url){
   runtimeInputs.set(inputId,input);void runImportPipeline(jobId,s);return send(res,202,{jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/status'&&method==='POST'){
-  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,progress:job.pipeline?reportPipelineProgress(job,job.pipelineWorkerActive):job.progress,rateLimit:job.rateLimit,counts:job.counts,relationCompleted:job.relationCompleted,relationIssueCount:job.relationIssues?.length||0,retryAt:Math.min(...Object.entries(job.retries||{}).filter(([key])=>runtimeOutcomes.get(key)?.status==='deferred').map(([,retry])=>retry.nextAt)),rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,outcome:importOutcome(job),progress:job.pipeline?reportPipelineProgress(job,job.pipelineWorkerActive):job.progress,rateLimit:job.rateLimit,counts:job.counts,relationCompleted:job.relationCompleted,relationIssueCount:job.relationIssues?.length||0,retryAt:Math.min(...Object.entries(job.retries||{}).filter(([key])=>runtimeOutcomes.get(key)?.status==='deferred').map(([,retry])=>retry.nextAt)),rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/stop'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');job.stopRequested=true;await storeJob(b.jobId,job,s.key);return send(res,200,{ok:true,expiresAt:s.last+ttl});}
  if(url==='/api/import/run/resume'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');if(job.connectionId!==s.data.activeId)throw fail(409,'בחרו את החיבור ששימש לריצה לפני ההמשך.');if(!['paused','stopped','error'].includes(job.state))throw fail(409,'הריצה אינה מושהית.');job.state='running';job.finishedAt=null;job.stopRequested=false;await startDurableImport(b.jobId,job,s);if(job.pipeline)void runImportPipeline(b.jobId,s);else void runBackgroundImport(b.jobId,s);return send(res,202,{jobId:b.jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});}
  if(url==='/api/import/run/start'&&method==='POST'){
   const b=await bodyOf(req);if([...backgroundJobs.values()].some(job=>job.type==='import_run'&&job.ownerId===s.userId&&job.connectionId===s.data.activeId&&job.state==='running'))throw fail(409,'כבר פועל ייבוא ברקע בחיבור הזה. התקדמותו מוצגת ברשימת התהליכים.');if(!Array.isArray(b.planIds)||!b.planIds.length||!Array.isArray(b.order))throw fail(422,'לא נמצאה תוכנית כתיבה קפואה. בצעו Dry Run חדש.');const selected=b.planIds.map(id=>runtimePlans.get(id));if(selected.some(p=>!p||p.ownerId!==s.userId||p.connectionId!==s.data.activeId))throw fail(409,'תוכנית הייבוא אינה שייכת לחיבור הפעיל.');
+  const observed=new Set();
+  for(const plan of selected)for(const row of plan.result.rows){
+   const key=JSON.stringify([plan.targetId,plan.targetKey,String(row.matchKey)]);
+   if(observed.has(key))throw fail(422,'יותר מרשומת מקור אחת מופנית לאותו מפתח יעד: '+row.matchKey);
+   observed.add(key);
+  }
   const planSet=new Set(b.planIds),expected=new Set();for(const planId of b.planIds){const plan=runtimePlans.get(planId);for(let index=0;index<plan.result.rows.length;index++)if(plan.result.rows[index].status==='planned')expected.add(planId+':'+index);}
   const order=b.order.map(item=>({planId:item?.planId,index:Number(item?.index)})),seen=new Set();for(const item of order){const key=item.planId+':'+item.index;if(!planSet.has(item.planId)||!Number.isInteger(item.index)||!expected.has(key)||seen.has(key))throw fail(422,'סדר הכתיבה אינו תואם ל־Dry Run. בצעו בדיקה חדשה.');seen.add(key);}if(seen.size!==expected.size)throw fail(422,'סדר הכתיבה חסר רשומות שאושרו ב־Dry Run.');
   const connection=s.data.connections.find(c=>c.id===s.data.activeId),allRows=selected.flatMap(p=>p.result.rows),requestTotal=order.reduce((sum,item)=>sum+(runtimePlans.get(item.planId).result.rows[item.index].requests?.length||1),0),jobId=randomUUID(),baseProgress={completed:0,total:order.length,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:requestTotal},baseCounts={input:allRows.length,planned:order.length,skipped:allRows.filter(r=>r.status==='skipped').length,blocked:allRows.filter(r=>r.status==='blocked').length,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0},job={type:'import_run',ownerId:s.userId,username:s.username,connectionName:connection?.name||'',connectionId:s.data.activeId,connectionVersion:connection?.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,order:structuredClone(order),completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};await startDurableImport(jobId,job,s);
@@ -1082,7 +1218,7 @@ async function api(req,res,url){
  }else throw fail(404,'הפעולה לא נמצאה.');
  await commit(s,next);send(res,200,publicData(s));
 }
-const assets={'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
+const assets={'/import-file.js':['import-file.js','text/javascript; charset=utf-8'],'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
 const server=http.createServer((req,res)=>{
  res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'");
  const run=async()=>{try{
