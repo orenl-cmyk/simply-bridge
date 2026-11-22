@@ -16,7 +16,7 @@ import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
 import {writeSimply,executeRow} from './run.mjs';
 import {rateSnapshot,rateEtaSeconds,setConnectionRateCap,environmentKey} from './rate-limit.mjs';
 import {validatePreset} from './presets.mjs';
-import {saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
+import {saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const appVersion=JSON.parse(await readFile(path.join(root,'package.json'),'utf8')).version;
@@ -90,28 +90,24 @@ const jobRelationCache=new Map(),completedRelationTasks=new Map();
 const livePlan=plan=>({...plan,batch:plan.batch?{...plan.batch,nodes:new Map(plan.batch.nodes||[])}:null});
 async function storeJob(id,job,key){await saveDurableJob(directory,key,id,job);}
 async function hydrateDurable(s,{recover=false}={}){
- const loaded=await loadDurableState(directory,s.key);
- for(const [id,payload] of loaded.payloads)runtimeInputs.set(id,payload);
- for(const [id,plan] of loaded.plans)if(!runtimePlans.has(id))runtimePlans.set(id,livePlan(plan));
- for(const [jobId,events] of loaded.events){
-  const stored=loaded.jobs.get(jobId);
-  if(stored?.cleanupPending||stored?.cleanedAt)continue;
-  for(const event of events){if(event.type==='outcome'&&event.id)runtimeOutcomes.set(event.id,event.value);if(event.type==='outcome-clear'&&event.id)runtimeOutcomes.set(event.id,undefined);}
- }
- for(const [id,stored] of loaded.jobs){
+ const closedCaches=[];
+ const reader=await readDurableState(directory,s.key);
+ for(const [id,payload] of reader.objects('payloads'))runtimeInputs.set(id,payload);
+ for(const [id,plan] of reader.objects('plans'))if(!runtimePlans.has(id))runtimePlans.set(id,livePlan(plan));
+ for(const [id,job] of reader.objects('jobs')){
   if(backgroundJobs.has(id))continue;
-  const job=structuredClone(stored),events=loaded.events.get(id)||[];
+  const events=()=>reader.events(id);
   if(job.type==='import_run'&&!job.cleanupPending&&!job.cleanedAt){
    job.counts=structuredClone(job.baseCounts||job.counts||{});job.progress=structuredClone(job.baseProgress||job.progress||{});job.rows=[];job.completedKeys=[];
-   for(const event of events)if(event.type==='retry'){
+   for(const event of events())if(event.type==='retry'){
     job.retries??={};
     job.retries[event.key]=event.retry;
    }
    const cache=new Map();
-   for(const event of events)if(event.type==='relation-close')job.relationsClosedAt=event.at;
-   if(job.relationsClosedAt)await deleteDurableJob(directory,'cache-'+id);
+   for(const event of events())if(event.type==='relation-close')job.relationsClosedAt=event.at;
+   if(job.relationsClosedAt)closedCaches.push('cache-'+id);
    else{
-    for(const event of loaded.events.get('cache-'+id)||[])cache.set(event.key,event.candidates);
+    for(const event of reader.events('cache-'+id))cache.set(event.key,event.candidates);
     if(cache.size)jobRelationCache.set(id,cache);
    }
    job.relationCompleted=0;
@@ -119,7 +115,9 @@ async function hydrateDurable(s,{recover=false}={}){
    const completedRelations=new Set();
    completedRelationTasks.set(id,completedRelations);
    job.pendingRelationRepair=null;
-   for(const event of events){
+   for(const event of events()){
+    if(event.type==='outcome'&&event.id)runtimeOutcomes.set(event.id,event.value);
+    if(event.type==='outcome-clear'&&event.id)runtimeOutcomes.set(event.id,undefined);
     if(event.type==='relation-repair-queued')job.pendingRelationRepair=event.command;
     if(event.type==='relation-repair-finished')job.pendingRelationRepair=null;
     if(event.type==='relation-repair')replaceRelationIssues(job,event);
@@ -132,14 +130,15 @@ async function hydrateDurable(s,{recover=false}={}){
     }
    }
    const completed=new Set();
-   for(const event of events){if(event.type!=='progress'||completed.has(event.key))continue;completed.add(event.key);job.completedKeys.push(event.key);job.counts[event.status]=(job.counts[event.status]||0)+1;if(event.row&&event.status!=='succeeded')job.rows.push(event.row);job.progress.completed++;job.progress.apiRequestsCompleted+=Number(event.apiRequests)||0;}
-   for(const event of events){if(event.type!=='repair')continue;const index=job.rows.findIndex(row=>(row.planId+':'+row.index)===event.key);if(index>=0){if(event.row?.status==='succeeded')job.rows.splice(index,1);else job.rows[index]={...job.rows[index],...event.row,...event.meta};}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}}
+   for(const event of events()){if(event.type!=='progress'||completed.has(event.key))continue;completed.add(event.key);job.completedKeys.push(event.key);job.counts[event.status]=(job.counts[event.status]||0)+1;if(event.row&&event.status!=='succeeded')job.rows.push(event.row);job.progress.completed++;job.progress.apiRequestsCompleted+=Number(event.apiRequests)||0;}
+   for(const event of events()){if(event.type!=='repair')continue;const index=job.rows.findIndex(row=>(row.planId+':'+row.index)===event.key);if(index>=0){if(event.row?.status==='succeeded')job.rows.splice(index,1);else job.rows[index]={...job.rows[index],...event.row,...event.meta};}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}}
    job.progress.percent=job.progress.total?Math.floor(job.progress.completed*100/job.progress.total):100;
    if(job.state==='running'&&job.stopRequested){job.state='stopped';job.finishedAt=Date.now();}
    if(job.state==='running'&&(!recover||!job.autoRecover)){job.state='paused';job.pauseKind='restart';job.pauseReason='השרת הופעל מחדש. אפשר להמשיך בבטחה מאותה נקודה לאחר בדיקת החיבור.';job.finishedAt=null;}
   }
   backgroundJobs.set(id,job);
  }
+ for(const id of closedCaches)await deleteDurableJob(directory,id);
 }
 function scheduleBlackIssue(id,job,key,connection,recover=false){
  const workerKey=Buffer.from(key);

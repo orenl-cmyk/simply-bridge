@@ -162,20 +162,35 @@ export async function finishWriteIntent(directory,key,jobId,rowId,value,progress
  });
 }
 
+export async function readDurableState(directory,key){
+ const db=await store(directory,key);
+ const records=db.prepare('SELECT id,payload FROM objects WHERE kind=? ORDER BY id');
+ const owners=db.prepare('SELECT owner FROM events UNION SELECT owner FROM intents');
+ const events=db.prepare('SELECT payload FROM events WHERE owner=? ORDER BY sequence');
+ const intents=db.prepare('SELECT id,payload FROM intents WHERE owner=? ORDER BY id');
+ const decrypt=payload=>open(JSON.parse(payload),key);
+ return {
+  *objects(kind){
+   for(const row of records.iterate(kind))yield [row.id,decrypt(row.payload)];
+  },
+  *eventOwners(){
+   for(const row of owners.iterate())yield row.owner;
+  },
+  *events(owner){
+   for(const row of events.iterate(owner))yield decrypt(row.payload);
+   for(const row of intents.iterate(owner))yield {type:'outcome',id:row.id,value:decrypt(row.payload)};
+  }
+ };
+}
+
 export async function loadDurableState(directory,key){
- const db=await store(directory,key),state={jobs:new Map(),plans:new Map(),payloads:new Map(),events:new Map()};
- for(const {kind,id,payload} of db.prepare('SELECT kind,id,payload FROM objects').iterate()){
-  state[kind].set(id,open(JSON.parse(payload),key));
- }
- for(const {owner,payload} of db.prepare('SELECT owner,payload FROM events ORDER BY owner,sequence').iterate()){
-  if(!state.events.has(owner))state.events.set(owner,[]);
-  state.events.get(owner).push(open(JSON.parse(payload),key));
- }
- for(const {owner,id,payload} of db.prepare('SELECT owner,id,payload FROM intents').iterate()){
-  if(!state.events.has(owner))state.events.set(owner,[]);
-  state.events.get(owner).push({type:'outcome',id,value:open(JSON.parse(payload),key)});
- }
- return state;
+ const reader=await readDurableState(directory,key);
+ return {
+  jobs:new Map(reader.objects('jobs')),
+  plans:new Map(reader.objects('plans')),
+  payloads:new Map(reader.objects('payloads')),
+  events:new Map([...reader.eventOwners()].map(owner=>[owner,[...reader.events(owner)]]))
+ };
 }
 
 async function remove(directory,kind,id){
