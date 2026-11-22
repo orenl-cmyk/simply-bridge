@@ -1,0 +1,80 @@
+SIMPLY BRIDGE 0.24.0 — התקנה עם Podman Compose דרך CMD
+========================================================
+
+תכולת חבילת ה-ZIP:
+- simply-bridge-0.24.0-linux-amd64.tar — Image יחיד עם התגים 0.24.0 ו-current
+- simply-bridge-0.24.0-linux-amd64.tar.sha256 — SHA256 של קובץ ה-TAR
+- compose.yaml — הגדרת Podman Compose
+- INSTALL-PODMAN-CMD.txt — הוראות אלה
+
+דרישות
+------
+- Podman מותקן ופועל. ב-Windows, הפעל Podman Machine.
+- Podman Compose provider זמין: הפקודה `podman compose version` צריכה להציג גרסה.
+- Image זה מיועד ל-linux/amd64.
+- כדי לגשת ממחשבים אחרים ברשת, יש לאפשר TCP בפורט 4318 ב-Firewall עבור הרשת המורשית.
+  אל תחשוף HTTP לאינטרנט הציבורי; השתמש ב-TLS לפני חשיפה כזו.
+
+התקנה חדשה
+----------
+1. חלץ את ה-ZIP לתיקייה בשרת שבו Podman פועל ופתח CMD בתוך התיקייה.
+2. ודא את ה-TAR. הרץ:
+
+   certutil -hashfile simply-bridge-0.24.0-linux-amd64.tar SHA256
+
+   השווה את ערך ה-SHA256 לתוכן הקובץ
+   simply-bridge-0.24.0-linux-amd64.tar.sha256.
+
+3. הפעל את Podman ובדוק ש-Compose זמין:
+
+   podman machine start
+   podman compose version
+
+   אם Podman Machine כבר פועל, הודעת מצב קיימת אינה מונעת המשך.
+
+4. הגדר את כתובת השרת שבה המשתמשים יפתחו את Simply Bridge. החלף את כתובת הדוגמה
+   בכתובת IP או בשם DNS של השרת. הרץ את השורות באותו חלון CMD שבו תפעיל Compose:
+
+   set "BRIDGE_IMAGE=simply-bridge:0.24.0"
+   set "PUBLIC_URL=http://192.168.1.50:4318/"
+   set "HOST_PORT=4318"
+   set "BIND_IP=0.0.0.0"
+   set "DATA_VOLUME=simply-bridge-data"
+
+   אם השרת מוגדר לכתובת/פורט אחרים, שמור על התאמה בין PUBLIC_URL לבין HOST_PORT.
+   ההגדרות האלה נשמרות בחלון CMD הנוכחי בלבד; בחלון חדש יש להגדיר אותן שוב.
+
+5. טען את ה-Image המקומי מה-TAR:
+
+   podman load -i simply-bridge-0.24.0-linux-amd64.tar
+
+6. בדוק שהתגים נטענו והצג את הגדרת Compose לאחר פתרון המשתנים:
+
+   podman images
+   podman compose -f compose.yaml config
+
+   ודא שה-Image הוא simply-bridge:0.24.0, שהפורט הוא 4318 ושה-volume הוא
+   simply-bridge-data לפני שממשיכים.
+
+7. הפעל ללא Build וללא Pull מהרשת:
+
+   podman compose -f compose.yaml up -d --no-build
+   podman compose -f compose.yaml ps
+   podman compose -f compose.yaml logs --tail 100 bridge
+
+8. ממחשב מורשה ברשת, פתח בדפדפן את הערך שהגדרת ב-PUBLIC_URL, למשל:
+
+   http://192.168.1.50:4318/
+
+   בהפעלה ראשונה יש להשלים את הגדרת המשתמש והחיבורים בתוך הממשק. החבילה אינה
+   מכילה משתמשים, סיסמאות, מפתחות או קובצי סביבה.
+
+רשת ואחסון
+----------
+- Compose יוצר רשת פנימית ליישום ומפרסם את פורט 4318 על כתובת BIND_IP.
+- BIND_IP=0.0.0.0 מאפשר גישה דרך ממשקי הרשת של השרת; הגבל את הגישה ב-Firewall
+  לרשת ולמחשבים המורשים בלבד.
+- הנתונים נשמרים ב-volume בשם DATA_VOLUME. שמור על אותו שם בהפעלה מחדש ובעדכון.
+- אין להריץ `podman compose down -v` אם רוצים לשמור את נתוני Simply Bridge.
+- לעצירה רגילה: `podman compose -f compose.yaml down`.
+- להפעלה מחדש: הגדר שוב את משתני CMD מסעיף 4, ואז הרץ `podman compose -f compose.yaml up -d --no-build`.
