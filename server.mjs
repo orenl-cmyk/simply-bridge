@@ -1,3 +1,5 @@
+import {resolveBlackIssue,validateBlackConfig} from './black-issue-resolver.mjs';
+import {createRelationFinalizer,indexImportIdentities,validateRelationRuleSets} from './relation-finalizer.mjs';
 import {exportAll} from './export-pages.mjs';
 import {prepareImport,materializeDependencies,nodeKey} from './import-plan.mjs';
 import {fetchRelations,verifyRelations} from './relations.mjs';
@@ -7,12 +9,12 @@ import http from 'node:http';
 import {readFile,writeFile,mkdir,rename} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {randomBytes,randomUUID,scryptSync,createCipheriv,createDecipheriv} from 'node:crypto';
+import {randomBytes,randomUUID,scryptSync,createCipheriv,createDecipheriv,timingSafeEqual} from 'node:crypto';
 import {readOrigami,normalizeEntities,normalizeStructure,excludedEntity} from './origami.mjs';
 import {exportEntity,createPackage} from './transfer.mjs';
 import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
 import {writeSimply,executeRow} from './run.mjs';
-import {rateSnapshot,rateEtaSeconds} from './rate-limit.mjs';
+import {rateSnapshot,rateEtaSeconds,setConnectionRateCap} from './rate-limit.mjs';
 import {validatePreset} from './presets.mjs';
 import {saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
 
@@ -27,6 +29,17 @@ const directory=path.resolve(process.env.DATA_DIR||path.join(root,'data'));
 const recoveryKeyFile=process.env.BRIDGE_RECOVERY_KEY_FILE;
 const serviceKey=recoveryKeyFile?await readFile(recoveryKeyFile):null;
 if(serviceKey&&serviceKey.length!==32)throw Error('BRIDGE_RECOVERY_KEY_FILE must contain 32 raw bytes');
+const relationRulesFile=process.env.BRIDGE_RELATION_RULES_FILE;
+const relationRules=relationRulesFile?validateRelationRuleSets(JSON.parse(await readFile(relationRulesFile,'utf8'))):new Map();
+const blackConfigFile=process.env.BRIDGE_BLACK_CONFIG_FILE;
+const blackConfig=blackConfigFile?validateBlackConfig(JSON.parse(await readFile(blackConfigFile,'utf8'))):null;
+const blackToken=blackConfig&&process.env.BRIDGE_BLACK_TOKEN_FILE?
+ (await readFile(process.env.BRIDGE_BLACK_TOKEN_FILE,'utf8')).trim():null;
+if(blackConfig&&(!serviceKey||!blackToken||!/^[A-Za-z0-9_-]{32,256}$/.test(blackToken))){
+ throw Error('BLACK resolver requires recovery and webhook keys');
+}
+if(blackConfig)setConnectionRateCap(blackConfig.connectionId,8);
+let blackQueue=Promise.resolve();
 const vaultPath=path.join(directory,'connections.vault.json');
 const usersPath=path.join(directory,'users.json');
 const ttl=15*60*1000,planTtl=30*24*60*60*1000;
@@ -73,6 +86,7 @@ function clean(body,old){
 async function bodyOf(req){const bulk=['/api/import/dry-run','/api/import/fetch-relations','/api/import/prepare','/api/import/prepare/start','/api/import/pipeline/start','/api/import/run/start','/api/presets/save','/api/import-presets/save','/api/export/entity'].includes(req.url),chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(!bulk&&size>32768)throw fail(413,'הבקשה גדולה מדי.');chunks.push(chunk);}try{return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}catch{throw fail(400,'בקשה לא תקינה.');}}
 function send(res,status,data,headers={}){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8',...headers});res.end(JSON.stringify(data));}
 const durablePlan=plan=>({...plan,batch:plan.batch?{...plan.batch,nodes:[...plan.batch.nodes]}:null});
+const jobRelationCache=new Map(),completedRelationTasks=new Map();
 const livePlan=plan=>({...plan,batch:plan.batch?{...plan.batch,nodes:new Map(plan.batch.nodes||[])}:null});
 async function storeJob(id,job,key){await saveDurableJob(directory,key,id,job);}
 async function hydrateDurable(s,{recover=false}={}){
@@ -85,6 +99,31 @@ async function hydrateDurable(s,{recover=false}={}){
   const job=structuredClone(stored),events=loaded.events.get(id)||[];
   if(job.type==='import_run'){
    job.counts=structuredClone(job.baseCounts||job.counts||{});job.progress=structuredClone(job.baseProgress||job.progress||{});job.rows=[];job.completedKeys=[];
+   for(const event of events)if(event.type==='retry'){
+    job.retries??={};
+    job.retries[event.key]=event.retry;
+   }
+   const cache=new Map();
+   for(const event of events)if(event.type==='relation-close')job.relationsClosedAt=event.at;
+   if(job.relationsClosedAt)await deleteDurableJob(directory,'cache-'+id);
+   else{
+    for(const event of loaded.events.get('cache-'+id)||[])cache.set(event.key,event.candidates);
+    if(cache.size)jobRelationCache.set(id,cache);
+   }
+   job.relationCompleted=0;
+   job.relationIssues=[];
+   const completedRelations=new Set();
+   completedRelationTasks.set(id,completedRelations);
+   for(const event of events){
+    if(event.type==='relation-repair')replaceRelationIssues(job,event);
+    if(event.type==='relation-intent')job.relationInFlight=event.cursor;
+    if(event.type==='relation-progress'){
+     job.relationInFlight=null;
+     if(event.taskId)completedRelations.add(event.taskId);
+     job.relationCompleted++;
+     if(event.issues.length)job.relationIssues.push(...event.issues);
+    }
+   }
    const completed=new Set();
    for(const event of events){if(event.type!=='progress'||completed.has(event.key))continue;completed.add(event.key);job.completedKeys.push(event.key);job.counts[event.status]=(job.counts[event.status]||0)+1;if(event.row&&event.status!=='succeeded')job.rows.push(event.row);job.progress.completed++;job.progress.apiRequestsCompleted+=Number(event.apiRequests)||0;}
    for(const event of events){if(event.type!=='repair')continue;const index=job.rows.findIndex(row=>(row.planId+':'+row.index)===event.key);if(index>=0){if(event.row?.status==='succeeded')job.rows.splice(index,1);else job.rows[index]={...job.rows[index],...event.row,...event.meta};}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}}
@@ -95,6 +134,58 @@ async function hydrateDurable(s,{recover=false}={}){
   backgroundJobs.set(id,job);
  }
 }
+function scheduleBlackIssue(id,job,key,connection,recover=false){
+ const workerKey=Buffer.from(key);
+ blackQueue=blackQueue.then(async()=>{
+  try{
+   job.state='running';
+   await storeJob(id,job,workerKey);
+   const result=await resolveBlackIssue({config:job.config,connection,issueId:job.issueId,recover});
+   job.relationIssues=result.issues;
+   job.state=result.issues.some(issue=>issue.kind==='technical_failure')?'needs_attention':result.issues.length?'completed_with_gaps':'done';
+  }catch{
+   job.state='needs_attention';
+   job.error='פתרון קשרי התקלה נכשל. יש לבדוק את החיבור והמיפוי.';
+  }finally{
+   job.finishedAt=Date.now();
+   try{await storeJob(id,job,workerKey);}finally{workerKey.fill(0);}
+  }
+ }).catch(()=>console.error('Could not persist BLACK job',id));
+}
+
+async function blackIssueApi(req,res,url){
+ if(!blackConfig)throw fail(404,'הפעולה לא נמצאה.');
+ const actual=Buffer.from(req.headers.authorization||'');
+ const expected=Buffer.from('Bearer '+blackToken);
+ if(actual.length!==expected.length||!timingSafeEqual(actual,expected))throw fail(401,'נדרש אימות שירות.');
+ if(req.method!=='POST'||req.headers['content-type']?.split(';')[0]!=='application/json'){
+  throw fail(400,'נדרשת בקשת JSON.');
+ }
+ const body=await bodyOf(req);
+ if(url==='/api/issues/status'){
+  const job=backgroundJobs.get(body.jobId);
+  if(job?.type!=='black_issue')throw fail(404,'משימת התקלה לא נמצאה.');
+  return send(res,200,{state:job.state,issues:job.relationIssues,error:job.error});
+ }
+ if(typeof body.issueId!=='string'||! /^[A-Za-z0-9_-]{1,160}$/.test(body.issueId))throw fail(422,'מזהה תקלה לא תקין.');
+ const existing=[...backgroundJobs].find(([,job])=>job.type==='black_issue'&&
+  job.state==='queued'&&job.issueId===body.issueId&&job.connectionId===blackConfig.connectionId);
+ if(existing)return send(res,202,{jobId:existing[0],state:'queued'});
+ const key=await loadRecoveryKey(directory,serviceKey);
+ if(!key)throw fail(503,'נדרשת פתיחה ראשונה של הכספת להפעלת שירות התקלות.');
+ try{
+  const vault=decrypt(await envelope(),key);
+  const connection=vault.connections.find(connection=>connection.id===blackConfig.connectionId);
+  if(!connection)throw fail(503,'חיבור BLACK אינו זמין.');
+  const jobId=randomUUID(),job={type:'black_issue',state:'queued',issueId:body.issueId,
+   connectionId:connection.id,connectionVersion:connection.updatedAt,config:blackConfig,createdAt:Date.now()};
+  await storeJob(jobId,job,key);
+  backgroundJobs.set(jobId,job);
+  scheduleBlackIssue(jobId,job,key,connection);
+  return send(res,202,{jobId,state:'queued'});
+ }finally{key.fill(0);}
+}
+
 async function recoverBackgroundImports(){
  if(!serviceKey)return;
  const key=await loadRecoveryKey(directory,serviceKey);
@@ -104,6 +195,19 @@ async function recoverBackgroundImports(){
   const data=decrypt(storedVault,key);
   await hydrateDurable({key},{recover:true});
   for(const [id,job] of backgroundJobs){
+   if(job.type==='black_issue'&&['queued','running'].includes(job.state)){
+    const target=data.connections.find(c=>c.id===job.connectionId&&c.updatedAt===job.connectionVersion);
+    if(blackConfig?.connectionId===job.connectionId&&target&&
+       JSON.stringify(blackConfig)===JSON.stringify(job.config)){
+     const interrupted=job.state==='running';
+     job.state='queued';
+     scheduleBlackIssue(id,job,key,target,interrupted);
+    }else{
+     job.state='needs_attention';
+     job.error='הגדרת BLACK או החיבור המקורי השתנו.';
+     await storeJob(id,job,key);
+    }
+   }
    if(job.type!=='import_run'||job.state!=='running')continue;
    const connection=data.connections.find(c=>c.id===job.connectionId);
    if(!connection||connection.updatedAt!==job.connectionVersion||
@@ -184,21 +288,214 @@ async function executePlanRow(s,b,guard=()=>{}){
 async function runBackgroundImport(jobId,s,{finalize=true}={}){
  const job=backgroundJobs.get(jobId);if(!job||job.workerActive)return;const connection=s.data.connections.find(c=>c.id===job.connectionId);if(!connection){job.state='paused';job.pauseKind='connection';job.pauseReason='החיבור ששימש לריצה אינו זמין.';await storeJob(jobId,job,s.key);return;}
  job.workerActive=true;job.state='running';job.stopRequested=false;job.pauseKind=null;job.pauseReason=null;const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),durableJobId:jobId},completed=new Set(job.completedKeys||[]),startedAt=Date.now();let cursor=0,checkpoint=0;
- const take=()=>{while(job.state==='running'&&!job.stopRequested&&cursor<job.order.length){const item=job.order[cursor++],key=item.planId+':'+item.index;if(!completed.has(key))return {...item,key};}return null;};
- const workerLoop=async()=>{for(;;){const item=take();if(!item)return;let result;try{result=await executePlanRow(worker,item,()=>{});}catch(e){const plan=runtimePlans.get(item.planId),planned=plan?.result?.rows?.[item.index];result={row:{planId:item.planId,index:item.index,entityName:plan?.result?.name,targetEntity:plan?.targetId,sourceId:planned?.sourceId,action:planned?.action,status:'not_sent',sent:false,stop:false,error:{message:e.message}}};}const row=result.row;
+ const readyAgain=[];
+ const take=()=>{while(job.state==='running'&&!job.stopRequested&&cursor<job.order.length){const item=job.order[cursor++],key=item.planId+':'+item.index;if(!completed.has(key))return {...item,key};}return job.state==='running'&&!job.stopRequested?readyAgain.shift():null;};
+ const workerLoop=async()=>{for(;;){const item=take();if(!item)return;let result;try{
+    const retry=job.retries?.[item.key];
+    if(retry&&runtimeOutcomes.get(item.key)?.status==='deferred'){
+     while(Date.now()<retry.nextAt&&job.state==='running'&&!job.stopRequested){
+      await new Promise(resolve=>setTimeout(resolve,Math.min(250,retry.nextAt-Date.now())));
+     }
+     if(job.state!=='running'||job.stopRequested)return;
+     await appendDurableEvent(directory,worker.key,jobId,{type:'outcome-clear',id:item.key});
+     runtimeOutcomes.set(item.key,undefined);
+    }
+    result=await executePlanRow(worker,item,()=>{});
+   }catch(e){const plan=runtimePlans.get(item.planId),planned=plan?.result?.rows?.[item.index];result={row:{planId:item.planId,index:item.index,entityName:plan?.result?.name,targetEntity:plan?.targetId,sourceId:planned?.sourceId,action:planned?.action,status:'not_sent',sent:false,stop:false,error:{message:e.message}}};}const row=result.row;
+   if(job.autoRecover&&row.status==='deferred'&&!row.partial&&row.error?.kind==='rate_limit'){
+    const retry=job.retries?.[item.key]||{attempt:0};
+    if(retry.attempt<3){
+     retry.attempt++;
+     retry.nextAt=Date.now()+1000*2**retry.attempt;
+     job.retries??={};
+     job.retries[item.key]=retry;
+     await appendDurableEvent(directory,worker.key,jobId,{type:'retry',key:item.key,retry});
+     readyAgain.push(item);
+     continue;
+    }
+   }
    if(row.status==='deferred'||(row.stop&&['rate_limit','authorization','system'].includes(row.error?.kind))){job.state='paused';job.pauseKind=row.error?.kind||'temporary';job.pauseReason=row.error?.message||'הריצה הושהתה עקב תקלה זמנית.';job.lastDeferred={...row,planId:item.planId,index:item.index};await appendDurableEvent(directory,worker.key,jobId,{type:'pause',key:item.key,kind:job.pauseKind,reason:job.pauseReason,at:new Date().toISOString()});return;}
    completed.add(item.key);job.completedKeys=[...completed];job.counts[row.status]=(job.counts[row.status]||0)+1;if(row.status!=='succeeded')job.rows.push({...row,planId:item.planId,index:item.index});const apiRequests=row.sent===false?0:Math.max(1,row.completedRequests?.length||row.responses?.length||0);await appendDurableEvent(directory,worker.key,jobId,{type:'progress',key:item.key,status:row.status,apiRequests,...(row.status==='succeeded'?{}:{row:{...row,planId:item.planId,index:item.index}})});
-   const done=completed.size,elapsed=Math.max(1,(Date.now()-startedAt)/1000),remaining=Math.max(0,job.order.length-done),observed=done?Math.ceil(remaining/(done/elapsed)):0;job.rateLimit=rateSnapshot(connection);job.progress={...job.progress,completed:done,percent:job.order.length?Math.floor(done*100/job.order.length):100,etaSeconds:Math.max(observed,rateEtaSeconds(job.rateLimit,Math.max(remaining,job.progress.apiRequestsTotal-(job.progress.apiRequestsCompleted+apiRequests)))),apiRequestsCompleted:job.progress.apiRequestsCompleted+apiRequests};checkpoint++;if(checkpoint>=100){checkpoint=0;await storeJob(jobId,job,worker.key);}
+   const done=completed.size,elapsed=Math.max(1,(Date.now()-startedAt)/1000),remaining=Math.max(0,job.order.length-done),observed=done?Math.ceil(remaining/(done/elapsed)):0;job.rateLimit=rateSnapshot(connection);job.progress={...job.progress,completed:done,percent:job.order.length?Math.floor(done*100/job.order.length):100,etaSeconds:Math.max(observed,rateEtaSeconds(job.rateLimit,Math.max(remaining,job.progress.apiRequestsTotal-(job.progress.apiRequestsCompleted+apiRequests)))),apiRequestsCompleted:job.progress.apiRequestsCompleted+apiRequests,lastProgressAt:Date.now()};checkpoint++;if(checkpoint>=100){checkpoint=0;await storeJob(jobId,job,worker.key);}
   }};
  try{const concurrency=Math.min(Math.max(1,job.order.length-completed.size),connection.maxConcurrentRequests||3);await Promise.all(Array.from({length:concurrency},workerLoop));if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};if(finalize&&job.state!=='paused')job.finishedAt=Date.now();await storeJob(jobId,job,worker.key);}catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
 }
+function issueGroupKey(issue){return JSON.stringify([issue.kind,issue.entity,issue.fieldId,issue.role,issue.message]);}
+const relationRepairWorkers=new Set();
+
+function replaceRelationIssues(job,event){
+ const retried=new Set(event.retried);
+ if(event.choices)job.relationChoices={...job.relationChoices,...event.choices};
+ job.relationIssues=job.relationIssues.filter(issue=>
+  issueGroupKey(issue)!==event.group||!retried.has(issue.cursor)
+ );
+ job.relationIssues.push(...event.issues);
+ if(['done','completed_with_gaps'].includes(job.state)){
+  job.state=job.relationIssues.length?'completed_with_gaps':'done';
+ }
+}
+
+async function retryRelationGroup(jobId,job,{group,items,choices,rules},connection,key,actor){
+ try{
+  const input=runtimeInputs.get(job.inputId);
+  const identities=indexImportIdentities(job.planIds.map(id=>[id,runtimePlans.get(id)]),runtimeOutcomes);
+  const finalize=createRelationFinalizer({connection,rules,identities,schemas:new Map(input.schemas)});
+  for(const item of items){
+   const {planId,sourceId,entity,fieldId,cursor}=item;
+   const plan=runtimePlans.get(planId);
+   const record=plan.entity.records.find(record=>record.id===sourceId);
+   const staging=plan.relationStaging;
+   const envelope=JSON.parse(record.data[staging.groupId][0][staging.fieldId]);
+   if(fieldId)envelope.relations=envelope.relations.filter(entry=>entry.target.fieldId===fieldId);
+   const target=identities.get(JSON.stringify([plan.sourceEntity.meta.dataName,entity,sourceId]));
+   if(!target?.id)continue;
+   const problems=await finalize({envelope,entity,id:target.id,schema:plan.schema,indexes:record.groupIndexes,recover:true,choices:{...job.relationChoices,...choices}});
+   const event={type:'relation-repair',group,retried:[cursor],actor,choices,mapping:rules.filter(rule=>rule.sourceEntity===plan.sourceEntity.meta.dataName&&(!fieldId||rule.fieldId===fieldId)),at:new Date().toISOString(),
+    issues:problems.map(problem=>({...problem,entity,sourceId,planId,cursor}))};
+   await appendDurableEvent(directory,key,jobId,event);
+   replaceRelationIssues(job,event);
+  }
+  await storeJob(jobId,job,key);
+ }finally{
+  key.fill(0);
+  relationRepairWorkers.delete(jobId);
+ }
+}
+
+function reportPipelineProgress(job,active){
+ const progress={...job.progress};
+ const records=Number(progress.checkTotal)||0;
+ const checked=Number(progress.checked)||0;
+ const written=(Number(progress.completed)||0)+(job.counts.skipped||0);
+ const links=Number(job.relationCompleted)||0;
+ const relationTotal=Number(progress.relationsTotal)||0;
+ const expected=records*2+relationTotal;
+ const completed=checked+written+links;
+ const elapsed=(Date.now()-Date.parse(job.startedAt))/1000;
+ progress.overallPercent=progress.phase==='complete'?100:expected?
+  Math.min(99,Math.floor(100*completed/expected)):0;
+ progress.overallEtaSeconds=completed>=3&&elapsed>0?
+  Math.ceil(Math.max(0,expected-completed)/completed*elapsed):null;
+ progress.activity=active?'active':job.state==='running'?'stalled':job.state;
+ return progress;
+}
+
+function pipelineRelationWorker(jobId,job,worker,input){
+ const identities=new Map(),tasks=new Map(),waiting=new Map(),ready=[];
+ const completed=completedRelationTasks.get(jobId)||new Set();
+ completedRelationTasks.set(jobId,completed);
+ const cache=jobRelationCache.get(jobId)||new Map();
+ jobRelationCache.set(jobId,cache);
+ const connection=worker.data.connections.find(c=>c.id===job.connectionId);
+ const finalize=createRelationFinalizer({connection,rules:input.finalizerRules,identities,schemas:new Map(input.schemas),cache,
+  onCache:(key,candidates)=>appendDurableEvent(directory,worker.key,'cache-'+jobId,{type:'relation-cache',key,candidates})
+ });
+ const remaining=new Map();
+ const sourceDependency=name=>JSON.stringify(['source',name]);
+ const targetDependency=name=>JSON.stringify(['target',name]);
+ const batchDependencies=batch=>[sourceDependency(batch.entity.meta.dataName),targetDependency(batch.targetId)];
+ for(const batch of input.batches){
+  for(const key of batchDependencies(batch))remaining.set(key,(remaining.get(key)||0)+1);
+ }
+ const relationsTotal=input.batches.reduce((total,batch)=>total+(batch.relationStaging?batch.entity.records.length:0),0);
+ job.progress.relationsTotal=relationsTotal;
+ const rules=new Map(input.finalizerRules.map(rule=>[
+  JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId]),rule
+ ]));
+ let previousAt=Date.now(),rate=0;
+ const register=index=>{
+  const planId=job.planIds[index],plan=runtimePlans.get(planId);
+  if(!plan)throw Error('תוכנית הייבוא הדרושה להשלמת קישורים אינה זמינה.');
+  for(const [key,value] of indexImportIdentities([[planId,plan]],runtimeOutcomes))identities.set(key,value);
+  const source=plan.sourceEntity.meta.dataName;
+  for(const dependency of batchDependencies(input.batches[index])){
+   remaining.set(dependency,remaining.get(dependency)-1);
+   if(remaining.get(dependency)!==0)continue;
+   for(const task of waiting.get(dependency)||[]){
+    task.dependencies.delete(dependency);
+    if(!task.dependencies.size)ready.push(task);
+   }
+   waiting.delete(dependency);
+  }
+  if(!plan.relationStaging)return;
+  const {groupId,fieldId}=plan.relationStaging;
+  for(const [recordIndex,record] of plan.entity.records.entries()){
+   const taskId=planId+':'+recordIndex;
+   if(completed.has(taskId))continue;
+   const envelope=JSON.parse(record.data[groupId]?.[0]?.[fieldId]??'{"relations":[]}');
+   const dependencies=new Set();
+   for(const relation of envelope.relations){
+    const rule=rules.get(JSON.stringify([source,relation.target.groupId,relation.target.fieldId]));
+    const value=relation.source.value;
+    if(!rule||value===''||value===null||(Array.isArray(value)&&!value.length))continue;
+    for(const dependency of [sourceDependency(rule.sourceRelatedEntity),targetDependency(rule.targetEntity)]){
+     if(remaining.get(dependency)>0)dependencies.add(dependency);
+    }
+   }
+   const task={taskId,planId,plan,record,envelope,dependencies};
+   tasks.set(taskId,task);
+   for(const dependency of dependencies){
+    if(!waiting.has(dependency))waiting.set(dependency,[]);
+    waiting.get(dependency).push(task);
+   }
+   if(!dependencies.size)ready.push(task);
+  }
+ };
+ const drain=async()=>{
+  if(job.stopRequested||(!ready.length&&!job.relationInFlight))return;
+  const interrupted=tasks.get(job.relationInFlight);
+  if(interrupted&&!interrupted.dependencies.size)ready.unshift(interrupted);
+  job.progress.phase='relations';
+  for(const {taskId,planId,plan,record,envelope} of ready){
+   if(job.stopRequested)break;
+   if(completed.has(taskId))continue;
+   const identity=JSON.stringify([plan.sourceEntity.meta.dataName,plan.targetId,record.id]);
+   const id=identities.get(identity)?.id;
+   let problems=[];
+   if(envelope.relations.length&&id){
+    const recover=job.relationInFlight===taskId;
+    if(!recover){
+     await appendDurableEvent(directory,worker.key,jobId,{type:'relation-intent',cursor:taskId});
+     job.relationInFlight=taskId;
+    }
+    problems=await finalize({envelope,entity:plan.targetId,id,schema:plan.schema,indexes:record.groupIndexes,recover});
+   }else if(envelope.relations.length)problems=[{kind:'needs_attention',message:'רשומת הייבוא אינה זמינה להשלמת קישורים.'}];
+   const issues=problems.map(problem=>({...problem,entity:plan.targetId,sourceId:record.id,planId,cursor:taskId}));
+   await appendDurableEvent(directory,worker.key,jobId,{type:'relation-progress',taskId,issues});
+   job.relationInFlight=null;
+   completed.add(taskId);
+   tasks.delete(taskId);
+   job.relationCompleted=completed.size;
+   const now=Date.now(),sample=1000/Math.max(1,now-previousAt);
+   rate=rate?0.85*rate+0.15*sample:sample;
+   previousAt=now;
+   job.progress.relationEtaSeconds=completed.size>=3?Math.ceil((job.progress.relationsTotal-completed.size)/rate):null;
+   job.progress.lastProgressAt=now;
+   if(issues.length)(job.relationIssues??=[]).push(...issues);
+  }
+  ready.length=0;
+ };
+ return {register,drain};
+}
 async function runImportPipeline(jobId,s){
- const job=backgroundJobs.get(jobId),input=job&&runtimeInputs.get(job.inputId);if(!job||!input||job.pipelineWorkerActive)return;job.pipelineWorkerActive=true;const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),schemas:new Map(s.schemas)};worker.schemas.set(job.connectionId+':'+job.connectionVersion,new Map(input.schemas||[]));try{while(job.nextBatch<input.batches.length&&job.state==='running'&&!job.stopRequested){
+ const job=backgroundJobs.get(jobId),input=job&&runtimeInputs.get(job.inputId);if(!job||!input||job.pipelineWorkerActive)return;job.pipelineWorkerActive=true;const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),schemas:new Map(s.schemas)};worker.schemas.set(job.connectionId+':'+job.connectionVersion,new Map(input.schemas||[]));try{
+  const relations=input.finalizerRules?pipelineRelationWorker(jobId,job,worker,input):null;
+  if(relations){
+   for(let index=0;index<job.nextBatch;index++)relations.register(index);
+   await relations.drain();
+  }
+  while(job.nextBatch<input.batches.length&&job.state==='running'&&!job.stopRequested){
    const mapping=input.batches[job.nextBatch],connection=worker.data.connections.find(c=>c.id===job.connectionId);if(!connection)throw Error('חיבור היעד אינו זמין.');
    if(job.preparedBatch!==job.nextBatch){job.progress.phase='checking';job.progress.activeBatch=job.nextBatch+1;await storeJob(jobId,job,worker.key);const prepared=await buildImportPreparation({s:worker,c:connection,b:{schemaVersion:input.schemaVersion,mappings:[mapping],rules:input.rules||[]},guard:()=>{},onDebug:d=>job.debug=d,onProgress:p=>{job.progress.checked=job.checkedBeforeBatch+Number(p.records||0);}});job.planIds.push(...prepared.plans.map(p=>p.id));job.order.push(...prepared.order.map(({planId,index})=>({planId,index})));job.progress.checked=job.checkedBeforeBatch+mapping.entity.records.length;job.checkedBeforeBatch=job.progress.checked;job.baseProgress.checked=job.progress.checked;job.baseProgress.total=job.order.length;job.baseProgress.apiRequestsTotal=job.order.reduce((sum,item)=>sum+(runtimePlans.get(item.planId)?.result?.rows?.[item.index]?.requests?.length||1),0);job.progress.total=job.baseProgress.total;job.progress.apiRequestsTotal=job.baseProgress.apiRequestsTotal;const rows=prepared.plans.flatMap(p=>p.result.rows);job.baseCounts.input+=rows.length;job.baseCounts.planned+=prepared.order.length;job.baseCounts.skipped+=rows.filter(r=>r.status==='skipped').length;job.baseCounts.blocked+=rows.filter(r=>r.status==='blocked').length;for(const key of ['input','planned','skipped','blocked'])job.counts[key]=job.baseCounts[key];job.preparedBatch=job.nextBatch;job.progress.phase='writing';await storeJob(jobId,job,worker.key);}
-   await runBackgroundImport(jobId,worker,{finalize:false});if(job.state!=='running')break;job.nextBatch++;job.preparedBatch=null;await storeJob(jobId,job,worker.key);
+   await runBackgroundImport(jobId,worker,{finalize:false});
+   if(job.state!=='running'||job.stopRequested)break;
+   relations?.register(job.nextBatch);
+   job.nextBatch++;
+   job.preparedBatch=null;
+   await storeJob(jobId,job,worker.key);
+   await relations?.drain();
   }
-  if(job.state==='running'){job.state=job.stopRequested?'stopped':'done';job.progress={...job.progress,phase:'complete',percent:100,etaSeconds:0};job.finishedAt=Date.now();}await storeJob(jobId,job,worker.key);
+  if(job.state==='running'){job.state=job.stopRequested?'stopped':job.relationIssues?.length?'completed_with_gaps':'done';job.progress={...job.progress,phase:'complete',percent:100,etaSeconds:0};job.finishedAt=Date.now();}await storeJob(jobId,job,worker.key);
  }catch(error){job.state='paused';job.pauseKind='system';job.pauseReason=error.message||'התהליך הושהה.';await storeJob(jobId,job,worker.key);}finally{job.pipelineWorkerActive=false;worker.key.fill(0);}
 }
 const dryGroupPrefix='dry-group:';
@@ -247,6 +544,7 @@ function repairIssues(s,{reportedOnly=false,status='',connectionId='',entity=''}
 function findRepairIssue(s,issueId){const split=String(issueId||'').indexOf('|');if(split<1)throw fail(422,'מזהה התקלה אינו תקין.');const jobId=issueId.slice(0,split),key=issueId.slice(split+1),job=backgroundJobs.get(jobId);if(!job||job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))throw fail(404,'התקלה לא נמצאה.');const row=job.rows.find(item=>(item.planId+':'+item.index)===key);if(!row)throw fail(404,'התקלה לא נמצאה.');return {jobId,key,job,row};}
 async function api(req,res,url){
  const method=req.method;
+ if(['/api/issues/resolve','/api/issues/status'].includes(url))return blackIssueApi(req,res,url);
  if(method!=='GET'&&(req.headers.origin!==origin||req.headers['content-type']?.split(';')[0]!=='application/json'))throw fail(403,'בקשה ממקור לא מורשה.');
  if(url==='/api/status'&&method==='GET'){let unlocked=false,currentUser=null;try{const current=auth(req,false);unlocked=true;currentUser={username:current.username,role:current.role};}catch{}const e=await envelope(),users=await userStore();return send(res,200,{initialized:!!e,accountsInitialized:!!users,migrationRequired:!!e&&!users,unlocked,currentUser});}
  if(['/api/setup','/api/unlock'].includes(url)&&method==='POST'){
@@ -262,7 +560,7 @@ async function api(req,res,url){
    if(!store){key=derive(b.password,salt);try{data=decrypt(e,key);}catch{key.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}const master=randomBytes(32);user={id:randomUUID(),...identity,role:'admin',wrap:wrapMaster(master,b.password),createdAt:new Date().toISOString()};await persist(data,master,salt);await saveUsers({version:1,users:[user]});key.fill(0);key=master;}
    else{user=store.users.find(x=>x.normalized===identity.normalized);if(!user)throw fail(401,'שם המשתמש או הסיסמה שגויים.');try{key=unwrapMaster(user,b.password);data=decrypt(e,key);}catch{key?.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}}
   }
-  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};sessions.set(current.token,current);await hydrateDurable(current);
+  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};await hydrateDurable(current);if(blackConfig&&current.role==='admin')await saveRecoveryKey(directory,serviceKey,key);sessions.set(current.token,current);
   return send(res,200,publicData(current),{'Set-Cookie':`${cookieName}=${current.token}; HttpOnly; SameSite=Strict; Path=${cookiePath}${secureCookie}`});
  }
  const s=auth(req,url!=='/api/jobs');
@@ -270,7 +568,7 @@ async function api(req,res,url){
  if(url==='/api/jobs'&&method==='GET')return send(res,200,{jobs:jobOverview(s.userId,s.data.connections),expiresAt:s.last+ttl});
  if(url==='/api/jobs/detail'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const transferId=String(b.jobId).slice(dryGroupPrefix.length),group=dryGroup(s.userId,transferId);if(!group)throw fail(404,'התהליך לא נמצא.');return send(res,200,{job:{...group,members:undefined,recovery:completedDryRecovery(s.userId,transferId),rows:group.members.filter(([,job])=>job.error).map(([,job])=>({status:'failed',sourceId:'אצווה '+(Number(job.batchIndex)+1),error:{message:job.error}}))},expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');const problems=(job.rows||[]).filter(row=>row.status!=='succeeded');return send(res,200,{job:{...job,key:undefined,rows:problems.slice(-500),hasMoreRows:problems.length>500},expiresAt:s.last+ttl});}
  if(url==='/api/jobs/artifact'&&method==='POST'){const b=await bodyOf(req),artifact=artifactFor(s.userId,b.jobId,!!b.failedOnly);return send(res,200,{...artifact,expiresAt:s.last+ttl});}
- if(url==='/api/jobs/delete'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const group=dryGroup(s.userId,String(b.jobId).slice(dryGroupPrefix.length));if(!group)throw fail(404,'התהליך לא נמצא.');if(group.state==='running')throw fail(409,'יש להמתין לסיום התהליך לפני מחיקתו.');for(const [id] of group.members){const member=backgroundJobs.get(id);backgroundJobs.delete(id);await deleteDurableJob(directory,id);if(member?.inputId){runtimeInputs.delete(member.inputId);await deleteDurablePayload(directory,member.inputId);}}return send(res,200,{ok:true,expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');if(job.state==='running')throw fail(409,'יש לעצור את התהליך לפני מחיקתו.');backgroundJobs.delete(b.jobId);await deleteDurableJob(directory,b.jobId);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}return send(res,200,{ok:true,expiresAt:s.last+ttl});}
+ if(url==='/api/jobs/delete'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const group=dryGroup(s.userId,String(b.jobId).slice(dryGroupPrefix.length));if(!group)throw fail(404,'התהליך לא נמצא.');if(group.state==='running')throw fail(409,'יש להמתין לסיום התהליך לפני מחיקתו.');for(const [id] of group.members){const member=backgroundJobs.get(id);backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(member?.inputId){runtimeInputs.delete(member.inputId);await deleteDurablePayload(directory,member.inputId);}}return send(res,200,{ok:true,expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');if(job.state==='running'||relationRepairWorkers.has(b.jobId))throw fail(409,'יש לעצור את התהליך לפני מחיקתו.');backgroundJobs.delete(b.jobId);jobRelationCache.delete(b.jobId);completedRelationTasks.delete(b.jobId);await deleteDurableJob(directory,'cache-'+b.jobId);await deleteDurableJob(directory,b.jobId);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}return send(res,200,{ok:true,expiresAt:s.last+ttl});}
  if(url==='/api/connections'&&method==='GET')return send(res,200,publicData(s));
  if(url==='/api/admin/users'&&method==='GET'){
   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');const store=await userStore();return send(res,200,{users:store.users.map(({id,username,role,createdAt})=>({id,username,role,createdAt,current:id===s.userId})),expiresAt:s.last+ttl});
@@ -281,6 +579,71 @@ async function api(req,res,url){
   else if(b.action==='reset'){const user=store.users.find(x=>x.id===b.id);if(!user)throw fail(404,'המשתמש לא נמצא.');if(typeof b.password!=='string'||b.password.length<10||b.password.length>1024)throw fail(400,'הסיסמה חייבת להכיל לפחות 10 תווים.');user.wrap=wrapMaster(s.key,b.password);for(const current of [...sessions.values()])if(current.userId===user.id&&current!==s)clear(current);}
   else if(b.action==='delete'){const index=store.users.findIndex(x=>x.id===b.id);if(index<0)throw fail(404,'המשתמש לא נמצא.');if(store.users[index].id===s.userId)throw fail(409,'לא ניתן למחוק את המשתמש המחובר.');if(store.users[index].role==='admin'&&store.users.filter(x=>x.role==='admin').length===1)throw fail(409,'לא ניתן למחוק את המנהל האחרון.');const [removed]=store.users.splice(index,1);for(const current of [...sessions.values()])if(current.userId===removed.id)clear(current);}
   else throw fail(400,'פעולת ניהול משתמשים אינה תקינה.');await saveUsers(store);return send(res,200,{users:store.users.map(({id,username,role,createdAt})=>({id,username,role,createdAt,current:id===s.userId})),expiresAt:s.last+ttl});
+ }
+ if(url==='/api/jobs/close-relations'&&method==='POST'){
+  const {jobId}=await bodyOf(req),job=backgroundJobs.get(jobId);
+  if(!job||job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId)){
+   throw fail(404,'המשימה לא נמצאה.');
+  }
+  if(job.relationsClosedAt)return send(res,200,{ok:true,expiresAt:s.last+ttl});
+  if(relationRepairWorkers.has(jobId)||!['done','completed_with_gaps'].includes(job.state)){
+   throw fail(409,'ניתן לסגור משימה לאחר סיום העיבוד.');
+  }
+  if(job.relationIssues?.length&&s.role!=='admin')throw fail(403,'סגירה עם חריגים דורשת מנהל.');
+  const at=new Date().toISOString();
+  await appendDurableEvent(directory,s.key,jobId,{type:'relation-close',at,actor:s.userId});
+  job.relationsClosedAt=at;
+  jobRelationCache.delete(jobId);
+  await deleteDurableJob(directory,'cache-'+jobId);
+  return send(res,200,{ok:true,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/retry-relations'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const {jobId,groupId,matchKey,targetId}=await bodyOf(req),job=backgroundJobs.get(jobId);
+  if(!job||job.relationsClosedAt||!['done','completed_with_gaps'].includes(job.state)||relationRepairWorkers.has(jobId)){
+   throw fail(409,'המשימה אינה זמינה לניסיון חוזר.');
+  }
+  const connection=s.data.connections.find(c=>c.id===job.connectionId&&c.updatedAt===job.connectionVersion);
+  const input=runtimeInputs.get(job.inputId);
+  if(!connection||!input?.finalizerRules||job.planIds.some(id=>!runtimePlans.has(id))){
+   throw fail(409,'תוכנית הקישורים או החיבור המקורי אינם זמינים.');
+  }
+  let matching=job.relationIssues.filter(issue=>issue.planId&&issueGroupKey(issue)===groupId);
+  let choices;
+  if(targetId!==undefined){
+   matching=matching.filter(issue=>issue.matchKey===matchKey&&issue.options?.includes(targetId));
+   choices={[matchKey]:targetId};
+  }
+  const items=[...new Map(matching.map(issue=>[issue.cursor,issue])).values()];
+  if(!items.length)throw fail(404,'קבוצת החריגים או רשומת היעד לא נמצאו.');
+  relationRepairWorkers.add(jobId);
+  const rules=relationRules.get(job.connectionId)||input.finalizerRules;
+  void retryRelationGroup(jobId,job,{group:groupId,items,choices,rules},connection,Buffer.from(s.key),s.userId)
+   .catch(()=>console.error('Relation retry interrupted',jobId));
+  return send(res,202,{scheduled:items.length,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/groups'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const groups=new Map();
+  const add=(jobId,issue)=>{
+   const groupId=issueGroupKey(issue),key=JSON.stringify([jobId,groupId]);
+   if(!groups.has(key))groups.set(key,{jobId,groupId,...issue,count:0,records:[],
+    canRetry:!!issue.planId&&!backgroundJobs.get(jobId)?.relationsClosedAt&&['done','completed_with_gaps'].includes(backgroundJobs.get(jobId)?.state),
+    retryActive:relationRepairWorkers.has(jobId),matches:[]});
+   const group=groups.get(key);
+   group.count++;
+   if(issue.matchKey&&group.matches.length<50&&!group.matches.some(match=>match.key===issue.matchKey)){
+    group.matches.push({key:issue.matchKey,value:issue.originalValue,options:issue.options});
+   }
+   if(issue.sourceId&&group.records.length<50)group.records.push(issue.sourceId);
+  };
+  for(const [jobId,job] of backgroundJobs){
+   for(const issue of job.relationIssues||[])add(jobId,issue);
+   if(job.type==='black_issue'&&job.error)add(jobId,{kind:job.state,message:job.error,sourceId:job.issueId});
+   for(const row of job.rows||[])add(jobId,{kind:row.error?.kind||row.status,entity:row.targetEntity,
+    message:row.error?.message||row.reasons?.join(' '),sourceId:row.sourceId});
+  }
+  return send(res,200,{groups:[...groups.values()].slice(0,500),totalGroups:groups.size,expiresAt:s.last+ttl});
  }
  if(url==='/api/repairs/list'&&method==='POST'){const b=await bodyOf(req),rows=repairIssues(s,b);return send(res,200,{rows:rows.slice(0,500),totalRows:rows.length,truncated:rows.length>500,expiresAt:s.last+ttl});}
  if(url==='/api/repairs/action'&&method==='POST'){
@@ -384,10 +747,10 @@ async function api(req,res,url){
  }
  if(url==='/api/import/pipeline/start'&&method==='POST'){
   const b=await bodyOf(req),connection=s.data.connections.find(c=>c.id===b.connectionId);if(!connection||s.data.activeId!==connection.id)throw fail(409,'בחרו חיבור יעד פעיל.');if(b.schemaVersion!=='1.0'||!Array.isArray(b.batches)||!b.batches.length)throw fail(422,'קובץ הייבוא או גרסתו אינם תקינים.');if([...backgroundJobs.values()].some(job=>job.type==='import_run'&&job.ownerId===s.userId&&job.connectionId===connection.id&&job.state==='running'))throw fail(409,'כבר פועל ייבוא ברקע בחיבור הזה.');
-  const schemas=s.schemas.get(connection.id+':'+connection.updatedAt);if(!schemas?.size)throw fail(422,'יש לטעון את מבנה ישות היעד לפני הפעלת הייבוא.');const checkTotal=b.batches.reduce((sum,item)=>sum+(Array.isArray(item?.entity?.records)?item.entity.records.length:0),0);if(!checkTotal)throw fail(422,'לא נמצאו רשומות לייבוא.');const jobId=randomUUID(),inputId='input-'+jobId,input={schemaVersion:b.schemaVersion,batches:structuredClone(b.batches),rules:structuredClone(b.rules||[]),schemas:[...schemas]},baseProgress={phase:'starting',checked:0,checkTotal,completed:0,total:0,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:0},baseCounts={input:0,planned:0,skipped:0,blocked:0,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0},job={type:'import_run',pipeline:true,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};await saveDurablePayload(directory,s.key,inputId,input);await startDurableImport(jobId,job,s);runtimeInputs.set(inputId,input);void runImportPipeline(jobId,s);return send(res,202,{jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});
+  const schemas=s.schemas.get(connection.id+':'+connection.updatedAt);if(!schemas?.size)throw fail(422,'יש לטעון את מבנה ישות היעד לפני הפעלת הייבוא.');const checkTotal=b.batches.reduce((sum,item)=>sum+(Array.isArray(item?.entity?.records)?item.entity.records.length:0),0);if(!checkTotal)throw fail(422,'לא נמצאו רשומות לייבוא.');const jobId=randomUUID(),inputId='input-'+jobId,input={schemaVersion:b.schemaVersion,batches:structuredClone(b.batches),rules:structuredClone(b.rules||[]),finalizerRules:relationRules.get(connection.id),schemas:[...schemas]},baseProgress={phase:'starting',checked:0,checkTotal,completed:0,total:0,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:0},baseCounts={input:0,planned:0,skipped:0,blocked:0,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0},job={type:'import_run',pipeline:true,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};await saveDurablePayload(directory,s.key,inputId,input);await startDurableImport(jobId,job,s);runtimeInputs.set(inputId,input);void runImportPipeline(jobId,s);return send(res,202,{jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/status'&&method==='POST'){
-  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,progress:job.progress,rateLimit:job.rateLimit,counts:job.counts,rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,progress:job.pipeline?reportPipelineProgress(job,job.pipelineWorkerActive):job.progress,rateLimit:job.rateLimit,counts:job.counts,relationCompleted:job.relationCompleted,relationIssueCount:job.relationIssues?.length||0,retryAt:Math.min(...Object.entries(job.retries||{}).filter(([key])=>runtimeOutcomes.get(key)?.status==='deferred').map(([,retry])=>retry.nextAt)),rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/stop'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');job.stopRequested=true;await storeJob(b.jobId,job,s.key);return send(res,200,{ok:true,expiresAt:s.last+ttl});}
  if(url==='/api/import/run/resume'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');if(job.connectionId!==s.data.activeId)throw fail(409,'בחרו את החיבור ששימש לריצה לפני ההמשך.');if(!['paused','stopped','error'].includes(job.state))throw fail(409,'הריצה אינה מושהית.');job.state='running';job.finishedAt=null;job.stopRequested=false;await startDurableImport(b.jobId,job,s);if(job.pipeline)void runImportPipeline(b.jobId,s);else void runBackgroundImport(b.jobId,s);return send(res,202,{jobId:b.jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});}
@@ -481,7 +844,7 @@ const server=http.createServer((req,res)=>{
  }};
  if((req.url.startsWith('/api/schema/')||req.url.startsWith('/api/export/')||req.url==='/api/import/dry-run'))void run();else queue=queue.then(run,run);
 });
-async function cleanupExpired(){for(const current of [...sessions.values()])if(Date.now()-current.last>ttl)clear(current);for(const [id,job] of backgroundJobs)if(job.finishedAt&&Date.now()-Number(job.finishedAt)>planTtl){backgroundJobs.delete(id);await deleteDurableJob(directory,id);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}}for(const [id,plan] of runtimePlans)if(Date.now()-plan.createdAt>planTtl){runtimePlans.delete(id);await deleteDurablePlan(directory,id);}}
+async function cleanupExpired(){for(const current of [...sessions.values()])if(Date.now()-current.last>ttl)clear(current);for(const [id,job] of backgroundJobs)if(!relationRepairWorkers.has(id)&&job.finishedAt&&Date.now()-Number(job.finishedAt)>planTtl){backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}}for(const [id,plan] of runtimePlans)if(Date.now()-plan.createdAt>planTtl){runtimePlans.delete(id);await deleteDurablePlan(directory,id);}}
 setInterval(()=>{void cleanupExpired().catch(error=>console.error('Durable cleanup failed',error));},30000).unref();
  await recoverBackgroundImports();
  server.listen(port,listenHost,()=>console.log(`SIMPLY BRIDGE ${appVersion}: ${origin}${basePath}`));

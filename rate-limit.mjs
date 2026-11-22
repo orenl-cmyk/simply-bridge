@@ -18,12 +18,17 @@ export function createLimiter({spacingMs=100,maxConcurrent=3,windowMs=60*60*1000
  };
 }
 
-const states=new Map();
+const states=new Map(),connectionCaps=new Map();
+export function setConnectionRateCap(id,requestsPerSecond){
+ connectionCaps.set(id,requestsPerSecond);
+}
 const connectionKey=connection=>String(connection?.id||connection?.baseUrl||'default');
 function configured(connection){
- const rps=Number.isFinite(Number(connection?.maxRequestsPerSecond))?Math.max(0,Number(connection.maxRequestsPerSecond)):10;
+ const configuredRps=Number.isFinite(Number(connection?.maxRequestsPerSecond))?Math.max(0,Number(connection.maxRequestsPerSecond)):10;
  const hourly=Number.isFinite(Number(connection?.maxRequestsPerHour))?Math.max(0,Math.floor(Number(connection.maxRequestsPerHour))):5000;
  const maxConcurrent=Number.isFinite(Number(connection?.maxConcurrentRequests))?Math.min(100,Math.max(1,Math.floor(Number(connection.maxConcurrentRequests)))):3;
+ const cap=connectionCaps.get(connection?.id);
+ const rps=cap?Math.min(configuredRps||cap,cap):configuredRps;
  return {rps,hourly,maxConcurrent};
 }
 export function rateState(connection){

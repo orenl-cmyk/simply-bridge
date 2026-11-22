@@ -105,3 +105,84 @@ running imports against their original connection. Jobs paused for intervention
 and jobs explicitly stopped remain available for authenticated handling.
 If an interrupted write cannot be confirmed from destination values, the
 application records it for review and proceeds with independent records.
+
+## Relation processing
+
+Both relation features are opt-in. Mount configuration files read-only and
+use the container paths in the environment variables below. The files use
+Origami data names and Bridge connection IDs. Configure the same settings
+when restarting a container.
+
+### Import Relation Finalizer
+
+Set `BRIDGE_RELATION_RULES_FILE` to a JSON object keyed by destination Bridge
+connection ID. Each value is an array of rule objects, for example:
+
+```json
+{
+  "destination-connection-id": [
+    {
+      "sourceEntity": "source_issues",
+      "sourceRelatedEntity": "source_inventory",
+      "groupId": "destination_group",
+      "fieldId": "destination_inventory_relation",
+      "targetEntity": "destination_inventory",
+      "targetKey": {
+        "kind": "field",
+        "groupId": "destination_inventory_group",
+        "fieldId": "external_key"
+      },
+      "valueMode": "sourceText"
+    }
+  ]
+}
+```
+
+Use `sourceText` for a source label stored in the target matching field,
+`sourceId` for a target matching field holding the original source ID, or
+`packageKey` for the related record's exported match key. Historical presets
+can keep the same relation staging field. Assign a single writer to these
+relations by disabling the Node-RED relation workflow for imports managed by
+the Finalizer. Verify the clear and multi-value formats in a representative
+test environment before enabling writes.
+
+### BLACK issue webhook
+
+Set `BRIDGE_BLACK_CONFIG_FILE` and `BRIDGE_BLACK_TOKEN_FILE`, alongside
+`BRIDGE_RECOVERY_KEY_FILE`. The administrator opens the vault once after
+configuration so the webhook can accept jobs without a browser session.
+The token file holds one random URL-safe token of at least 32 characters.
+
+```json
+{
+  "connectionId": "black-connection-id",
+  "issueEntity": "issues",
+  "source": {
+    "base": "original_base",
+    "building": "original_building",
+    "floor": "original_floor",
+    "room": "original_room",
+    "topic": "subject",
+    "item": "item_name"
+  },
+  "destination": {
+    "base": "base_relation",
+    "building": "building_relation",
+    "floor": "floor_relation",
+    "room": "room_relation",
+    "inventory": "inventory_relation"
+  },
+  "base": {"entity": "bases", "name": "_id"},
+  "building": {"entity": "buildings", "name": "name", "base": "base"},
+  "floor": {"entity": "floors", "name": "name", "building": "building", "base": "base"},
+  "room": {"entity": "rooms", "name": "name", "floor": "floor", "building": "building", "base": "base"},
+  "catalog": {"entity": "catalog", "name": "name", "topic": "subject"},
+  "inventory": {"entity": "inventory", "base": "base", "building": "building", "floor": "floor", "topic": "subject", "catalog": "catalog_item"}
+}
+```
+
+Send `POST /api/issues/resolve` with a JSON body containing `issueId` and
+`Authorization: Bearer <token>`. Use an HTTPS endpoint for the bearer token.
+Poll `POST /api/issues/status` with the same authorization and the returned
+`jobId`. Match queries send `with_archive: 0`; verify filtering with a sample
+that has both active and archived matches before enabling the integration.
