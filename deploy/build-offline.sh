@@ -8,7 +8,7 @@ version="$(node -p "require('./package.json').version")"
 image="simply-bridge:${version}"
 current="simply-bridge:current"
 release_dir="$(mktemp -d "$PWD/bridge-release-XXXXXX")"
-docker build --platform "$platform" --build-arg "NODE_IMAGE=${NODE_IMAGE:-node:22-bookworm-slim}" -t "$image" .
+docker build --platform "$platform" --build-arg "NODE_IMAGE=${NODE_IMAGE:-node:22.23.5-bookworm-slim}" -t "$image" .
 # Tests run inside the image runtime, without internet and without user data.
 docker run --rm --network none --entrypoint node --tmpfs /work:uid=1000,gid=1000 -v "$PWD/test:/app/test:ro" "$image" --test --test-concurrency=1 '/app/test/*.test.mjs'
 
