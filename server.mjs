@@ -17,7 +17,7 @@ import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
 import {writeSimply,executeRow} from './run.mjs';
 import {rateSnapshot,rateEtaSeconds,setConnectionRateCap,environmentKey,restoreEnvironmentRate} from './rate-limit.mjs';
 import {validatePreset} from './presets.mjs';
-import {saveSegmentedPlan,loadPlanMapping,loadPlanWork,loadPlanLinks,savePlanWork,finishPlanLink,importIdentityIndex,clearImportIdentities,clearImportKeys,saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
+import {queueRowRepair,finishRowRepair,saveSegmentedPlan,loadPlanMapping,loadPlanWork,loadPlanLinks,savePlanWork,finishPlanLink,importIdentityIndex,clearImportIdentities,clearImportKeys,saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const appVersion=JSON.parse(await readFile(path.join(root,'package.json'),'utf8')).version;
@@ -193,6 +193,7 @@ async function hydrateDurable(s,{recover=false}={}){
    const completedRelations=new Set();
    completedRelationTasks.set(id,completedRelations);
    job.pendingRelationRepair=null;
+   job.pendingRowRepairs=new Map([...reader.rowRepairs(id)].map(command=>[command.key,command]));
    for(const event of events()){
     if(event.type==='outcome'&&event.id&&activeRow(event.id))runtimeOutcomes.set(event.id,event.value);
     if(event.type==='outcome-clear'&&event.id&&activeRow(event.id))runtimeOutcomes.set(event.id,undefined);
@@ -211,6 +212,7 @@ async function hydrateDurable(s,{recover=false}={}){
    for(const event of events()){if(event.type!=='progress'||!activeRow(event.key)||completed.has(event.key))continue;completed.add(event.key);job.completedKeys.push(event.key);job.counts[event.status]=(job.counts[event.status]||0)+1;if(event.row&&event.status!=='succeeded')job.rows.push(event.row);job.progress.completed++;job.progress.apiRequestsCompleted+=Number(event.apiRequests)||0;}
    for(const event of events()){if(event.type!=='repair')continue;const index=job.rows.findIndex(row=>(row.planId+':'+row.index)===event.key);if(index>=0){if(event.row?.status==='succeeded')job.rows.splice(index,1);else job.rows[index]={...job.rows[index],...event.row,...event.meta};}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}}
    removeFinishedWrites(job);
+   if(job.state==='completed_with_gaps'&&!hasImportGaps(job))job.state='done';
    job.progress.percent=job.progress.total?Math.floor(job.progress.completed*100/job.progress.total):100;
    if(job.state==='running'&&job.stopRequested){job.state='stopped';job.finishedAt=Date.now();}
    if(job.state==='running'&&(!recover||!job.autoRecover)){job.state='paused';job.pauseKind='restart';job.pauseReason='השרת הופעל מחדש. אפשר להמשיך בבטחה מאותה נקודה לאחר בדיקת החיבור.';job.finishedAt=null;}
@@ -331,6 +333,7 @@ async function recoverBackgroundImports(){
      scheduleRelationRepair(id,job,target,key);
     }
    }
+   launchPendingRowRepairs(id,job,{key,data});
    if(job.state!=='running')continue;
    const connection=data.connections.find(c=>c.id===job.connectionId);
    if(!connection||connection.updatedAt!==job.connectionVersion||
@@ -472,6 +475,44 @@ async function verifyImportWrite({connection,entity,plan,relationData,guard,onDe
  return latest;
 }
 
+async function verifyRowRepairOrImport(command,options){
+ if(!command?.requests)return verifyImportWrite(options);
+ const {connection,entity,plan,guard}=options;
+ const key=plan.targetKey.kind==='recordId'?'_id':plan.targetKey.fieldId;
+ const value=entity.records[0].matchKey;
+ const raw=await readOrigami(connection,'instance_data',{entity_data_name:plan.targetId,
+  filter:[[key,'=',value]],limit:[0,2],with_archive:1},options.onDebug,guard);
+ guard();
+ const record=raw.data?.[0]?.instance_data;
+ const fields=(group,index)=>group?.fields_data?.find(row=>row.some(field=>field.group_index!=null&&Number(field.group_index)===index))||
+  (index===0?group?.fields_data?.[0]:undefined);
+ const groups=record?.field_groups||[];
+ const exact=(field,expected)=>field&&Object.hasOwn(field,'value')&&
+  JSON.stringify(field.value)===JSON.stringify(expected);
+ const matchField=plan.targetKey.kind==='recordId'?record?._id:
+  fields(groups.find(group=>group.field_group_data?.group_data_name===plan.targetKey.groupId),0)
+   ?.find(field=>field.field_data_name===key)?.value;
+ const matches=raw.data?.length===1&&Number(raw.info?.total_count)===1&&record?._id&&String(matchField)===String(value);
+ if(matches&&command.requests.every(({operation,body})=>{
+  if(body.entity_data_name!==plan.targetId)return false;
+  if(operation==='update_instance_fields'){
+   if(JSON.stringify(body.filter)!==JSON.stringify([['_id','=',record._id]]))return false;
+   return body.field?.length&&body.field.every(([name,expected,index])=>{
+    const candidates=groups.map(group=>fields(group,Number(index))?.find(field=>field.field_data_name===name)).filter(Boolean);
+    return candidates.length===1&&exact(candidates[0],expected);
+   });
+  }
+  if(operation!=='create_instance')return false;
+  return body.form_data?.length&&body.form_data.every(group=>group.data?.length&&group.data.every((row,index)=>{
+   const actual=fields(groups.find(item=>item.field_group_data?.group_data_name===group.group_data_name),index);
+   return Object.entries(row).every(([name,value])=>exact(actual?.find(field=>field.field_data_name===name),value));
+  }));
+ })){
+  return {status:'skipped',targetId:record._id};
+ }
+ return {status:Array.isArray(raw.data)&&raw.data.length===0&&Number(raw.info?.total_count)===0?'absent':'blocked',targetId:matches?record._id:null};
+}
+
 async function executePlanRow(s,b,guard=()=>{}){
  const plan=runtimePlans.get(b.planId),index=b.index;
  if(!plan||plan.ownerId!==s.userId||!Number.isInteger(index)||index<0||index>=plan.result.rows.length)throw fail(422,'בדיקת הייבוא פגה או שהרשומה אינה תקינה. בצעו Dry Run חדש.');
@@ -486,10 +527,10 @@ async function executePlanRow(s,b,guard=()=>{}){
  const workRef=plan.segmented?{planId:b.planId,index}:undefined;
  if(previous?.status==='pending'){
   const interrupted={...previous,status:'unknown',sent:true,stop:false,finishedAt:new Date().toISOString(),error:{message:'הכתיבה שהופסקה לא אומתה ביעד. יש לבדוק אותה במרכז התיקונים.'}};
-  if(serviceKey&&s.durableJobId&&work){
+  if(s.durableJobId&&work){
    try{
     const entity={...plan.entity,records:[work.targetRecord]};
-    const fresh=await verifyImportWrite({connection:c,entity,plan,relationData:{[work.targetRecord.id]:work.relationData},guard,attempts:3});
+    const fresh=await verifyRowRepairOrImport(s.rowRepair,{connection:c,entity,plan,relationData:{[work.targetRecord.id]:work.relationData},guard,attempts:3});
     if(fresh.status==='skipped'&&fresh.targetId){
      interrupted.status='succeeded';
      interrupted.targetId=fresh.targetId;
@@ -507,9 +548,10 @@ async function executePlanRow(s,b,guard=()=>{}){
   return {row:interrupted,replayed:true,progressRecorded:interrupted.status==='succeeded'&&s.recordWriteProgress};
  }
  if(!work)throw fail(409,'נתוני העבודה לשורה אינם זמינים.');
- if(plan.halted||plan.batch?.halted||Date.now()-plan.createdAt>planTtl)throw fail(409,'הריצה נעצרה או שהבדיקה פגה. בדקו את הדוח לפני Dry Run חדש.');
+ if(plan.halted||plan.batch?.halted||(!s.rowRepair&&Date.now()-plan.createdAt>planTtl))throw fail(409,'הריצה נעצרה או שהבדיקה פגה. בדקו את הדוח לפני Dry Run חדש.');
  let planned=work.planned;let effectiveRelationData={[work.targetRecord.id]:work.relationData};
  if(plan.batch&&planned.status==='planned'){const item=plan.batch.nodes.get(nodeKey(plan.entity.meta.dataName,planned.sourceId)),outcomes=new Map(item.dependencies.map(key=>{const ref=plan.batch.nodes.get(key);return [key,outcome(ref?.planId+':'+ref?.index)];}));const materialized=materializeDependencies({planned,relationData:effectiveRelationData[planned.sourceId],dependencies:item.dependencies,outcomes});if(materialized.notReady)throw fail(409,'יש לבצע קודם את הרשומות הקודמות בסדר הכתיבה.');if(materialized.blocked)planned={...planned,status:'blocked',reasons:[materialized.reason]};else{planned=materialized.planned;effectiveRelationData={...effectiveRelationData,[planned.sourceId]:materialized.relationData};}}
+ if(s.rowRepair?.requests)planned={...planned,requests:s.rowRepair.requests};
  const recordKey=[plan.targetId,plan.targetKey.kind,plan.targetKey.groupId||'',plan.targetKey.fieldId||'',
   String(plan.targetKey.kind==='recordId'?planned.sourceId:planned.matchKey)];
  const key=JSON.stringify([environmentKey(c),...recordKey]),legacyKey=JSON.stringify([c.id,...recordKey]);
@@ -537,7 +579,7 @@ async function executePlanRow(s,b,guard=()=>{}){
  let debug;const write=(r,step)=>writeSimply(c,step.operation,step.body,d=>debug=d,guard);
  const reconcile=async({completed,error})=>{
   const entity={...plan.entity,records:[work.targetRecord]};
-  const fresh=await verifyImportWrite({connection:c,entity,plan,relationData:effectiveRelationData,
+  const fresh=await verifyRowRepairOrImport(s.rowRepair,{connection:c,entity,plan,relationData:effectiveRelationData,
    guard,onDebug:d=>{debug=d;},attempts:error.kind==='uniqueness'?1:3});
   if(fresh.status==='skipped')return {sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:fresh.targetId||planned.targetId,status:'succeeded',sent:true,stop:false,reconciled:true,reconciliation:'הכתיבה נמצאה ביעד לאחר תשובה לא ידועה.',completedRequests:completed,warnings:planned.warnings};
   if(error.kind==='uniqueness'){
@@ -547,6 +589,19 @@ async function executePlanRow(s,b,guard=()=>{}){
   }
   return {sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:fresh.targetId||planned.targetId,status:'unknown',sent:true,stop:false,reconciled:false,completedRequests:completed,error:{kind:'ambiguous_write',message:'לא ניתן לאמת את הכתיבה ביעד: '+(fresh.reasons||[]).join('; '),details:error.details}};
  };
+ if(s.rowRepair&&(planned.action==='create'||s.rowRepair.partial)&&planned.status==='planned'){
+  const requests=planned.requests?.length?planned.requests:[planned.request];
+  const fresh=await verifyRowRepairOrImport({requests},{
+   connection:c,entity:{...plan.entity,records:[work.targetRecord]},plan,guard,onDebug:d=>{debug=d;}
+  });
+  if(fresh.status!=='absent'||s.rowRepair.partial){
+   const row=fresh.status==='skipped'?
+    {status:'succeeded',targetId:fresh.targetId,reconciled:true,sent:false}:
+    {status:'not_sent',sent:false,error:{kind:'target_present_or_uncertain',message:'התיקון לא נשלח. לא ניתן לאשר ניסיון נוסף ללא סיכון לכתיבה כפולה.'}};
+   await save({...row,finishedAt:new Date().toISOString()});
+   return {row:diagnostic(row),debug};
+  }
+ }
  const row=await executeRow({planned,write,recordIntent:()=>save({status:'pending',sent:true,stop:false}),recordResult:r=>save({...r,finishedAt:new Date().toISOString()}),reconcile});
  if(!row.sent)await save({...row,finishedAt:new Date().toISOString()});
  return {row:row.status==='succeeded'?compact(row):(plan.segmented&&s.durableJobId)?diagnostic(row):{...base,...row},debug};
@@ -589,6 +644,47 @@ async function runBackgroundImport(jobId,s,{finalize=true}={}){
   }};
  try{const concurrency=Math.min(Math.max(1,job.progress.total-(job.baseProgress.completed||0)-completed.size),connection.maxConcurrentRequests||3);await Promise.all(Array.from({length:concurrency},workerLoop));removeFinishedWrites(job);if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};if(finalize&&job.state!=='paused')job.finishedAt=Date.now();await storeJob(jobId,job,worker.key);}catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
 }
+const activeRowRepairs=new Set();
+
+function launchPendingRowRepairs(jobId,job,session){
+ for(const command of job.pendingRowRepairs?.values()||[]){
+  void processRowRepair(jobId,job,command,session).catch(()=>console.error('Row repair interrupted',jobId));
+ }
+}
+
+async function processRowRepair(jobId,job,command,session){
+ const taskId=jobId+':'+command.key;
+ if(activeRowRepairs.has(taskId))return {status:'running'};
+ const plan=runtimePlans.get(command.planId);
+ const connection=session.data.connections.find(c=>c.id===job.connectionId&&c.updatedAt===job.connectionVersion);
+ if(!plan||!connection)return {status:'pending'};
+ activeRowRepairs.add(taskId);
+ const worker={key:Buffer.from(session.key),userId:job.ownerId,data:{...session.data,activeId:connection.id},
+  durableJobId:jobId,rowRepair:command};
+ try{
+  const result=(await executePlanRow(worker,{planId:command.planId,index:command.index})).row;
+  const {responses,completedRequests,recoveryRequests,...row}=result;
+  const meta={repairStatus:row.status==='succeeded'?'resolved':'retry_failed',retriedAt:new Date().toISOString()};
+  const event={type:'repair',key:command.key,fromStatus:command.fromStatus,row:{...row,planId:command.planId,index:command.index},meta};
+  await finishRowRepair(directory,worker.key,jobId,command.key,event);
+  const index=job.rows.findIndex(row=>row.planId+':'+row.index===command.key);
+  if(index>=0){
+   if(row.status==='succeeded')job.rows.splice(index,1);
+   else job.rows[index]={...event.row,...meta};
+  }
+  job.counts[command.fromStatus]=Math.max(0,(job.counts[command.fromStatus]||0)-1);
+  job.counts[row.status]=(job.counts[row.status]||0)+1;
+  job.pendingRowRepairs.delete(command.key);
+  if(job.state==='completed_with_gaps'&&!hasImportGaps(job))job.state='done';
+  if(!job.workerActive)removeFinishedWrites(job);
+  await storeJob(jobId,job,worker.key);
+  return {status:row.status};
+ }finally{
+  worker.key.fill(0);
+  activeRowRepairs.delete(taskId);
+ }
+}
+
 function issueGroupKey(issue){return JSON.stringify([issue.kind,issue.entity,issue.fieldId,issue.sourceEntity,issue.role,issue.message]);}
 const relationRepairWorkers=new Set();
 
@@ -996,7 +1092,7 @@ async function api(req,res,url){
    if(!store){key=derive(b.password,salt);try{data=decrypt(e,key);}catch{key.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}const master=randomBytes(32);user={id:randomUUID(),...identity,role:'admin',wrap:wrapMaster(master,b.password),createdAt:new Date().toISOString()};await persist(data,master,salt);await saveUsers({version:1,users:[user]});key.fill(0);key=master;}
    else{user=store.users.find(x=>x.normalized===identity.normalized);if(!user)throw fail(401,'שם המשתמש או הסיסמה שגויים.');try{key=unwrapMaster(user,b.password);data=decrypt(e,key);}catch{key?.fill(0);failures++;if(failures>=5){blockedUntil=Date.now()+60000;failures=0;}throw fail(401,'שם המשתמש או הסיסמה שגויים.');}}
   }
-  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};await hydrateDurable(current);restoreJobRates(data.connections);if(blackConfig&&current.role==='admin')await saveRecoveryKey(directory,serviceKey,key);sessions.set(current.token,current);
+  failures=0;const current={key,salt,data,username:user.username,userId:user.id,role:user.role,schemas:new Map(),plans:new Map(),runOutcomes:new Map(),exports:new Map(),imports:new Map(),token:randomBytes(32).toString('hex'),last:Date.now()};await hydrateDurable(current);restoreJobRates(data.connections);for(const [id,job] of backgroundJobs)launchPendingRowRepairs(id,job,current);if(blackConfig&&current.role==='admin')await saveRecoveryKey(directory,serviceKey,key);sessions.set(current.token,current);
   return send(res,200,publicData(current),{'Set-Cookie':`${cookieName}=${current.token}; HttpOnly; SameSite=Strict; Path=${cookiePath}${secureCookie}`});
  }
  const s=auth(req,url!=='/api/jobs');
@@ -1004,7 +1100,7 @@ async function api(req,res,url){
  if(url==='/api/jobs'&&method==='GET')return send(res,200,{jobs:jobOverview(s.userId,s.data.connections),expiresAt:s.last+ttl});
  if(url==='/api/jobs/detail'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const transferId=String(b.jobId).slice(dryGroupPrefix.length),group=dryGroup(s.userId,transferId);if(!group)throw fail(404,'התהליך לא נמצא.');return send(res,200,{job:{...group,members:undefined,recovery:completedDryRecovery(s.userId,transferId),rows:group.members.filter(([,job])=>job.error).map(([,job])=>({status:'failed',sourceId:'אצווה '+(Number(job.batchIndex)+1),error:{message:job.error}}))},expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');const problems=(job.rows||[]).filter(row=>row.status!=='succeeded');return send(res,200,{job:{...job,key:undefined,rows:problems.slice(-500),hasMoreRows:problems.length>500},expiresAt:s.last+ttl});}
  if(url==='/api/jobs/artifact'&&method==='POST'){const b=await bodyOf(req),artifact=artifactFor(s.userId,b.jobId,!!b.failedOnly);return send(res,200,{...artifact,expiresAt:s.last+ttl});}
- if(url==='/api/jobs/delete'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const group=dryGroup(s.userId,String(b.jobId).slice(dryGroupPrefix.length));if(!group)throw fail(404,'התהליך לא נמצא.');if(group.state==='running')throw fail(409,'יש להמתין לסיום התהליך לפני מחיקתו.');for(const [id] of group.members){const member=backgroundJobs.get(id);backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(member?.inputId){runtimeInputs.delete(member.inputId);await deleteDurablePayload(directory,member.inputId);}}return send(res,200,{ok:true,expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');if(job.state==='running'||job.cleanupPending||relationRepairWorkers.has(b.jobId))throw fail(409,'יש לעצור את התהליך לפני מחיקתו.');backgroundJobs.delete(b.jobId);jobRelationCache.delete(b.jobId);completedRelationTasks.delete(b.jobId);await deleteDurableJob(directory,'cache-'+b.jobId);await deleteDurableJob(directory,b.jobId);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}return send(res,200,{ok:true,expiresAt:s.last+ttl});}
+ if(url==='/api/jobs/delete'&&method==='POST'){const b=await bodyOf(req);if(String(b.jobId).startsWith(dryGroupPrefix)){const group=dryGroup(s.userId,String(b.jobId).slice(dryGroupPrefix.length));if(!group)throw fail(404,'התהליך לא נמצא.');if(group.state==='running')throw fail(409,'יש להמתין לסיום התהליך לפני מחיקתו.');for(const [id] of group.members){const member=backgroundJobs.get(id);backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(member?.inputId){runtimeInputs.delete(member.inputId);await deleteDurablePayload(directory,member.inputId);}}return send(res,200,{ok:true,expiresAt:s.last+ttl});}const job=backgroundJobs.get(b.jobId);if(!job||job.ownerId!==s.userId)throw fail(404,'התהליך לא נמצא.');if(job.state==='running'||job.cleanupPending||job.pendingRowRepairs?.size||relationRepairWorkers.has(b.jobId))throw fail(409,'יש לעצור את התהליך לפני מחיקתו.');backgroundJobs.delete(b.jobId);jobRelationCache.delete(b.jobId);completedRelationTasks.delete(b.jobId);await deleteDurableJob(directory,'cache-'+b.jobId);await deleteDurableJob(directory,b.jobId);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}return send(res,200,{ok:true,expiresAt:s.last+ttl});}
  if(url==='/api/connections'&&method==='GET')return send(res,200,publicData(s));
  if(url==='/api/admin/users'&&method==='GET'){
   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');const store=await userStore();return send(res,200,{users:store.users.map(({id,username,role,createdAt})=>({id,username,role,createdAt,current:id===s.userId})),expiresAt:s.last+ttl});
@@ -1022,7 +1118,7 @@ async function api(req,res,url){
    throw fail(404,'המשימה לא נמצאה.');
   }
   if(job.relationsClosedAt)return send(res,200,{ok:true,expiresAt:s.last+ttl});
-  if(job.pendingRelationRepair||relationRepairWorkers.has(jobId)||!['done','completed_with_gaps'].includes(job.state)){
+  if(job.pendingRowRepairs?.size||job.pendingRelationRepair||relationRepairWorkers.has(jobId)||!['done','completed_with_gaps'].includes(job.state)){
    throw fail(409,'ניתן לסגור משימה לאחר סיום העיבוד.');
   }
   if(job.relationIssues?.length&&s.role!=='admin')throw fail(403,'סגירה עם חריגים דורשת מנהל.');
@@ -1121,8 +1217,44 @@ async function api(req,res,url){
   const b=await bodyOf(req),ids=Array.isArray(b.issueIds)?b.issueIds:[b.issueId];if(!ids.length||ids.length>500)throw fail(422,'יש לבחור בין תקלה אחת ל־500 תקלות.');const results=[];
   for(const issueId of ids){const issue=findRepairIssue(s,issueId),{jobId,key,job,row}=issue;if(b.action==='report'){if(job.ownerId!==s.userId)throw fail(403,'ניתן לדווח רק על תקלה בריצה שלך.');const meta={reportedAt:new Date().toISOString(),repairStatus:'reported',reportNote:String(b.note||'').slice(0,1000)};Object.assign(row,meta);await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,row,meta});await storeJob(jobId,job,s.key);results.push({issueId,status:'reported'});continue;}
    if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');if(b.action==='close'||b.action==='reopen'){const meta={repairStatus:b.action==='close'?'closed':'reported',closedAt:b.action==='close'?new Date().toISOString():null,adminNote:String(b.note||'').slice(0,1000)};Object.assign(row,meta);await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,row,meta});await storeJob(jobId,job,s.key);results.push({issueId,status:meta.repairStatus});continue;}
-   if(b.action==='retry'){if(!['failed','not_sent'].includes(row.status))throw fail(409,'תוצאה לא ידועה מחייבת אימות יעד לפני ניסיון חוזר; ניתן לסגור ידנית לאחר האימות.');const [planId,indexText]=key.split(':'),index=Number(indexText),plan=runtimePlans.get(planId);if(!plan)throw fail(409,'תוכנית הכתיבה אינה זמינה. יש להפעיל Dry Run חדש לתיקון ממוקד.');if(Array.isArray(b.writePayloads)){if(!b.writePayloads.length||b.writePayloads.length>50)throw fail(422,'רשימת בקשות התיקון אינה תקינה.');const work=plan.segmented?await loadPlanWork(directory,s.key,planId,index):null;const planned=work?.planned??plan.result.rows[index];const allowed=new Set((planned.requests||[]).map(item=>item.operation));if(b.writePayloads.some(item=>!allowed.has(item?.operation)||!item.body||typeof item.body!=='object'))throw fail(422,'בקשת התיקון חורגת מפעולות התוכנית המקורית.');planned.requests=structuredClone(b.writePayloads);if(work)await savePlanWork(directory,s.key,planId,index,work);else await saveDurablePlan(directory,s.key,planId,durablePlan(plan));}
-    const fromStatus=row.status;runtimeOutcomes.set(key,undefined);await appendDurableEvent(directory,s.key,jobId,{type:'outcome-clear',id:key});const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),durableJobId:jobId};let retried;try{retried=(await executePlanRow(worker,{planId,index},()=>{})).row;}finally{worker.key.fill(0);}const rowIndex=job.rows.indexOf(row);if(retried.status==='succeeded')job.rows.splice(rowIndex,1);else job.rows[rowIndex]={...retried,planId,index,repairStatus:'retry_failed'};job.counts[fromStatus]=Math.max(0,(job.counts[fromStatus]||0)-1);job.counts[retried.status]=(job.counts[retried.status]||0)+1;await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,fromStatus,row:{...retried,planId,index},meta:{repairStatus:retried.status==='succeeded'?'resolved':'retry_failed',retriedAt:new Date().toISOString()}});await storeJob(jobId,job,s.key);results.push({issueId,status:retried.status});continue;}
+   if(b.action==='retry'){
+    const existing=job.pendingRowRepairs?.get(key);
+    if(existing){results.push({issueId,...await processRowRepair(jobId,job,existing,s)});continue;}
+    if(!['failed','not_sent'].includes(row.status))throw fail(409,'תוצאה לא ידועה מחייבת אימות יעד לפני ניסיון חוזר; ניתן לסגור ידנית לאחר האימות.');
+    const [planId,indexText]=key.split(':'),index=Number(indexText),plan=runtimePlans.get(planId);
+    if(!plan||Date.now()-plan.createdAt>planTtl)throw fail(409,'תוכנית הכתיבה אינה זמינה. יש להפעיל Dry Run חדש לתיקון ממוקד.');
+    let requests;
+    if(Array.isArray(b.writePayloads)){
+     const work=plan.segmented?await loadPlanWork(directory,s.key,planId,index):null;
+     const planned=work?.planned??plan.result.rows[index];
+     const allowed=new Set((planned.requests||[]).map(item=>item.operation));
+     if(!b.writePayloads.length||b.writePayloads.length>50||b.writePayloads.some(item=>!allowed.has(item?.operation)||!item.body||typeof item.body!=='object')){
+      throw fail(422,'בקשת התיקון חורגת מפעולות התוכנית המקורית.');
+     }
+     for(const {operation,body} of b.writePayloads){
+      const original=(planned.requests||[]).find(step=>step.operation===operation)?.body;
+      if(body.entity_data_name!==plan.targetId||
+         (operation==='update_instance_fields'&&JSON.stringify(body.filter)!==JSON.stringify(original.filter))||
+         (operation==='add_group_repetition'&&body._id!==original._id)){
+       throw fail(422,'בקשת התיקון חייבת לפנות לרשומת היעד המקורית.');
+      }
+      if(operation==='create_instance'){
+       const group=body.form_data?.find?.(item=>item.group_data_name===plan.targetKey.groupId);
+       if(String(group?.data?.[0]?.[plan.targetKey.fieldId])!==String(row.matchKey)){
+        throw fail(422,'תיקון יצירה חייב לשמור על אותו מפתח הצלבה.');
+       }
+      }
+     }
+     requests=b.writePayloads;
+    }
+    const command={key,planId,index,fromStatus:row.status,partial:Boolean(row.partial),requests};
+    if(serviceKey)await saveRecoveryKey(directory,serviceKey,s.key);
+    await queueRowRepair(directory,s.key,jobId,key,command);
+    (job.pendingRowRepairs??=new Map()).set(key,command);
+    runtimeOutcomes.set(key,undefined);
+    results.push({issueId,...await processRowRepair(jobId,job,command,s)});
+    continue;
+   }
    throw fail(422,'פעולת התיקון אינה תקינה.');
   }return send(res,200,{results,expiresAt:s.last+ttl});
  }
@@ -1360,7 +1492,7 @@ const server=http.createServer((req,res)=>{
  }};
  if((req.url.startsWith('/api/schema/')||req.url.startsWith('/api/export/')||req.url==='/api/import/dry-run'))void run();else queue=queue.then(run,run);
 });
-async function cleanupExpired(){for(const current of [...sessions.values()])if(Date.now()-current.last>ttl)clear(current);for(const [id,job] of backgroundJobs)if(!relationRepairWorkers.has(id)&&job.finishedAt&&Date.now()-Number(job.finishedAt)>planTtl){backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}}for(const [id,plan] of runtimePlans)if(Date.now()-plan.createdAt>planTtl){runtimePlans.delete(id);await deleteDurablePlan(directory,id);}}
+async function cleanupExpired(){for(const current of [...sessions.values()])if(Date.now()-current.last>ttl)clear(current);for(const [id,job] of backgroundJobs)if(!job.pendingRowRepairs?.size&&!relationRepairWorkers.has(id)&&job.finishedAt&&Date.now()-Number(job.finishedAt)>planTtl){backgroundJobs.delete(id);jobRelationCache.delete(id);completedRelationTasks.delete(id);await deleteDurableJob(directory,'cache-'+id);await deleteDurableJob(directory,id);if(job.inputId){runtimeInputs.delete(job.inputId);await deleteDurablePayload(directory,job.inputId);}}const repairingPlans=new Set();for(const job of backgroundJobs.values())for(const command of job.pendingRowRepairs?.values()||[])repairingPlans.add(command.planId);for(const [id,plan] of runtimePlans)if(!repairingPlans.has(id)&&Date.now()-plan.createdAt>planTtl){runtimePlans.delete(id);await deleteDurablePlan(directory,id);}}
 setInterval(()=>{void cleanupExpired().catch(error=>console.error('Durable cleanup failed',error));},30000).unref();
  await recoverBackgroundImports();
  server.listen(port,listenHost,()=>console.log(`SIMPLY BRIDGE ${appVersion}: ${origin}${basePath}`));

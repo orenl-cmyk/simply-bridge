@@ -6,14 +6,14 @@ const root=fileURLToPath(new URL('../',import.meta.url));
 test('RUN creates, skips validation failure and continues; replay is idempotent; unknown writes survive restart and block repeats',async()=>{
  const rows=new Map(),writes=[];let serial=0,storedBeforeReply,dryProbe,dryReleased,repairStored,releaseRepair;const mock=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const b=JSON.parse(text);res.setHeader('content-type','application/json');if(req.url.includes('entity_structure'))return res.end(JSON.stringify({field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'title',field_type_name:'input-text'},{field_data_name:'external',field_type_name:'input-text'},{field_data_name:'link',field_type_name:'select-from-entity'},{field_data_name:'relation_json',field_type_name:'textarea'}]]}]}));if(req.url.includes('instance_data')){const value=b.filter[0][2];if(['dry-restart0','pipeline-third0','pipeline1','compact-second0','mixed-checkpoint0'].includes(value)&&dryProbe){const started=dryProbe;dryProbe=null;started();await dryReleased;}if(b.filter[0][1]==='in'){const matches=[...new Set(value)].flatMap(k=>rows.has(k)?[rows.get(k)]:[]);return res.end(JSON.stringify({info:{total_count:matches.length},data:matches.map(instance_data=>({instance_data}))}));}const r=b.filter[0][0]==='_id'?[...rows.values()].find(row=>row._id===value):rows.get(value);return res.end(JSON.stringify({info:{total_count:r?1:0},data:r?[{instance_data:r}]:[]}));}
  writes.push({url:req.url,body:b});const form=b.form_data?.[0]?.data[0];if(form?.title==='slow')await new Promise(r=>setTimeout(r,50));if(form?.title==='bad')return res.end(JSON.stringify({error:{type:'validation',column:[{field_data_name:'title',message:'invalid value'}]}}));if(form?.title==='timeout'){req.socket.destroy();return;}
- if(req.url.includes('create_instance')){const id='created-'+(++serial);rows.set(form.external,{_id:id,field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:form.external}]]}]});if(form.title==='restart after write'){rows.get(form.external).field_groups[0].fields_data[0].push({field_data_name:'title',value:form.title});storedBeforeReply();await new Promise(r=>setTimeout(r,500));}return res.end(JSON.stringify({success:'ok',results:{_id:id}}));}const updated=[...rows.values()].find(row=>row._id===b.filter?.[0]?.[2]);if(updated&&b.field){for(const [field_data_name,value] of b.field){const fields=updated.field_groups[0].fields_data[0];const cell=fields.find(field=>field.field_data_name===field_data_name);if(cell)cell.value=value;else fields.push({field_data_name,value});}}if(repairStored&&b.field?.some(([field,value])=>field==='link'&&value==='replacement')){
+ if(req.url.includes('create_instance')){const id='created-'+(++serial);rows.set(form.external,{_id:id,field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:form.external}]]}]});if(['restart after write','repair saved before reply'].includes(form.title)){rows.get(form.external).field_groups[0].fields_data[0].push({field_data_name:'title',value:form.title});storedBeforeReply();await new Promise(r=>setTimeout(r,500));}return res.end(JSON.stringify({success:'ok',results:{_id:id}}));}const updated=[...rows.values()].find(row=>row._id===b.filter?.[0]?.[2]);if(updated&&b.field){for(const [field_data_name,value] of b.field){const fields=updated.field_groups[0].fields_data[0];const cell=fields.find(field=>field.field_data_name===field_data_name);if(cell)cell.value=value;else fields.push({field_data_name,value});}}if(repairStored&&b.field?.some(([field,value])=>field==='link'&&value==='replacement')){
   const settled=repairStored;
   repairStored=null;
   settled();
   await releaseRepair;
  }
  res.end(JSON.stringify({success:'ok',results:{instances_updated:1}}));});await new Promise(r=>mock.listen(0,'127.0.0.1',r));
- const work=path.resolve(root,'../../work');await mkdir(work,{recursive:true});const data=await mkdtemp(path.join(work,'run-test-')),port=4342,origin=`http://127.0.0.1:${port}`;let child,cookie='',extraEnv={};
+ const work=path.resolve(root,'../../work');await mkdir(work,{recursive:true});const data=await mkdtemp(path.join(work,'run-test-')),port=Number(process.env.BRIDGE_TEST_PORT||4342),origin=`http://127.0.0.1:${port}`;let child,cookie='',extraEnv={};
  const keyFile=path.join(data,'service-key');await writeFile(keyFile,Buffer.alloc(32,42),{mode:0o600});
  const launch=async()=>{child=spawn(process.execPath,['--preserve-symlinks','--preserve-symlinks-main',path.join(root,'server.mjs')],{env:{...process.env,PORT:String(port),DATA_DIR:data,BRIDGE_RECOVERY_KEY_FILE:keyFile,...extraEnv},stdio:['ignore','pipe','pipe'],windowsHide:true});await new Promise((r,j)=>{child.stdout.once('data',r);child.once('error',j);child.once('exit',()=>j(Error('server stopped')));});};
  const stop=async()=>{if(child&&!child.killed){const exited=new Promise(r=>child.once('exit',r));child.kill();await exited;}};
@@ -139,7 +139,53 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  assert.equal(mixedStatus.counts.succeeded,500);
  assert.equal(writes.filter(write=>write.body.form_data?.[0]?.data[0]?.external?.startsWith('mixed-row')).length,500);
  assert.deepEqual(openPositions(mixedPlan),[499]);
+ const failedRows=(await call('repairs/list',{})).rows;
+ const failed=failedRows.find(row=>row.jobId===mixedRun.jobId&&row.matchKey==='mixed-row499');
+ assert.ok(failed);
+ const repaired=structuredClone(failed.writePayloads);
+ repaired[0].body.form_data[0].data[0].title='repair saved before reply';
+ const repairReachedTarget=new Promise(resolve=>{storedBeforeReply=resolve;});
+ const request=call('repairs/action',{action:'retry',issueId:failed.issueId,writePayloads:repaired}).catch(()=>null);
+ await Promise.race([repairReachedTarget,request.then(result=>{
+  throw Error('Repair ended before reaching Origami: '+JSON.stringify(result));
+ })]);
+ await stop();
+ await request;
+ cookie='';
+ await launch();
+ await call('unlock',{username:'admin',password:'test-password-123'});
+ let repairedStatus;
+ for(let i=0;i<100;i++){
+  repairedStatus=await call('import/run/status',{jobId:mixedRun.jobId});
+  if(repairedStatus.counts.failed===0)break;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ assert.equal(repairedStatus.counts.succeeded,501);
+ assert.equal(repairedStatus.counts.failed,0);
+ assert.equal(writes.filter(write=>write.body.form_data?.[0]?.data[0]?.title==='repair saved before reply').length,1);
+ assert.deepEqual(openPositions(mixedPlan),[]);
+ const repairedDb=new DatabaseSync(workDatabase,{readOnly:true});
+ try{assert.equal(repairedDb.prepare('SELECT count(*) AS count FROM row_repairs WHERE owner=?').get(mixedRun.jobId).count,0);}
+ finally{repairedDb.close();}
  await call('schema/structure',{connectionId:c,entityId:'appUsers'});
+ const existingTarget=await call('import/pipeline/start',{connectionId:c,schemaVersion:'1.0',batches:[
+  {...relationMapping,entity:entity(['bad'],'repair-existing')}
+ ]});
+ assert.equal(existingTarget.status,202);
+ for(let i=0;i<100;i++){
+  if((await call('import/run/status',{jobId:existingTarget.jobId})).state!=='running')break;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ const conflict=(await call('repairs/list',{})).rows.find(row=>row.jobId===existingTarget.jobId);
+ assert.ok(conflict);
+ rows.set('repair-existing0',{_id:'existing-target',field_groups:[{
+  field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:'repair-existing0'},
+   {field_data_name:'title',value:'other values'}]]
+ }]});
+ const beforeRepair=writes.length;
+ const guarded=await call('repairs/action',{action:'retry',issueId:conflict.issueId});
+ assert.equal(guarded.results[0].status,'not_sent');
+ assert.equal(writes.length,beforeRepair);
  if(loadRows){
   const parts=[JSON.stringify({connectionId:c,schemaVersion:'1.0'})+'\n'];
   for(let offset=0;offset<loadRows;offset+=500){

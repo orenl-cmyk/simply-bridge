@@ -110,6 +110,7 @@ async function openStore(directory,key){
    CREATE INDEX IF NOT EXISTS plan_mapping_lookup ON plan_mapping_refs(mapping);
    CREATE TABLE IF NOT EXISTS plan_work(plan TEXT, position INTEGER, payload TEXT NOT NULL, PRIMARY KEY(plan,position));
    CREATE TABLE IF NOT EXISTS plan_links(plan TEXT, position INTEGER, payload TEXT NOT NULL, PRIMARY KEY(plan,position));
+   CREATE TABLE IF NOT EXISTS row_repairs(owner TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(owner,id));
    CREATE TABLE IF NOT EXISTS intents(owner TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(owner,id));
   `);
   if(!db.prepare("SELECT 1 FROM migration WHERE name='complete'").get())await migrate(db,directory,key);
@@ -139,6 +140,7 @@ export async function saveDurableJob(directory,key,id,job){
  delete stored.workerActive;
  delete stored.pipelineWorkerActive;
  delete stored.pendingRelationRepair;
+ delete stored.pendingRowRepairs;
  if(stored.type==='import_run')delete stored.debug;
  await saveObject(directory,key,'jobs',id,stored);
 }
@@ -246,6 +248,22 @@ function insertEvent(db,key,owner,event){
   .run(owner,JSON.stringify(envelope(event,key)),owner);
 }
 
+export async function queueRowRepair(directory,key,jobId,id,command){
+ const db=await store(directory,key),owner=validId(jobId);
+ transaction(db,()=>{
+  db.prepare('INSERT INTO row_repairs VALUES (?,?,?)').run(owner,validId(id),JSON.stringify(envelope(command,key)));
+  insertEvent(db,key,owner,{type:'outcome-clear',id});
+ });
+}
+
+export async function finishRowRepair(directory,key,jobId,id,event){
+ const db=await store(directory,key),owner=validId(jobId);
+ transaction(db,()=>{
+  insertEvent(db,key,owner,event);
+  db.prepare('DELETE FROM row_repairs WHERE owner=? AND id=?').run(owner,validId(id));
+ });
+}
+
 export async function saveWriteIntent(directory,key,jobId,rowId,value){
  const db=await store(directory,key);
  db.prepare('INSERT INTO intents VALUES (?,?,?) ON CONFLICT(owner,id) DO UPDATE SET payload=excluded.payload')
@@ -268,6 +286,7 @@ export async function readDurableState(directory,key){
  const owners=db.prepare('SELECT owner FROM events UNION SELECT owner FROM intents');
  const events=db.prepare('SELECT payload FROM events WHERE owner=? ORDER BY sequence');
  const intents=db.prepare('SELECT id,payload FROM intents WHERE owner=? ORDER BY id');
+ const repairs=db.prepare('SELECT payload FROM row_repairs WHERE owner=?');
  const decrypt=payload=>open(JSON.parse(payload),key);
  return {
   *objects(kind){
@@ -276,6 +295,7 @@ export async function readDurableState(directory,key){
   *eventOwners(){
    for(const row of owners.iterate())yield row.owner;
   },
+  *rowRepairs(owner){for(const row of repairs.iterate(owner))yield decrypt(row.payload);},
   *events(owner){
    for(const row of events.iterate(owner))yield decrypt(row.payload);
    for(const row of intents.iterate(owner))yield {type:'outcome',id:row.id,value:decrypt(row.payload)};
@@ -311,6 +331,7 @@ async function remove(directory,kind,id){
   if(kind==='jobs'){
    db.prepare('DELETE FROM events WHERE owner=?').run(id);
    db.prepare('DELETE FROM intents WHERE owner=?').run(id);
+   db.prepare('DELETE FROM row_repairs WHERE owner=?').run(id);
    db.prepare('DELETE FROM relation_identities WHERE owner=?').run(id);
   }
  });
