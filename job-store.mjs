@@ -243,16 +243,35 @@ export async function appendDurableEvent(directory,key,jobId,event){
  insertEvent(db,key,validId(jobId),event);
 }
 
+export async function appendDurableEvents(directory,key,jobId,events){
+ const db=await store(directory,key),owner=validId(jobId);
+ transaction(db,()=>{
+  const insert=db.prepare('INSERT INTO events(owner,sequence,payload) VALUES (?,?,?)');
+  let sequence=Number(db.prepare('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE owner=?').get(owner).sequence);
+  for(const event of events)insert.run(owner,++sequence,JSON.stringify(envelope(event,key)));
+ });
+}
+
 function insertEvent(db,key,owner,event){
  db.prepare('INSERT INTO events SELECT ?,COALESCE(MAX(sequence),0)+1,? FROM events WHERE owner=?')
   .run(owner,JSON.stringify(envelope(event,key)),owner);
 }
 
 export async function queueRowRepair(directory,key,jobId,id,command){
+ return queueRowRepairs(directory,key,jobId,[{id,command}]);
+}
+
+export async function queueRowRepairs(directory,key,jobId,repairs){
  const db=await store(directory,key),owner=validId(jobId);
  transaction(db,()=>{
-  db.prepare('INSERT INTO row_repairs VALUES (?,?,?)').run(owner,validId(id),JSON.stringify(envelope(command,key)));
-  insertEvent(db,key,owner,{type:'outcome-clear',id});
+  const put=db.prepare('INSERT INTO row_repairs VALUES (?,?,?)');
+  const event=db.prepare('INSERT INTO events(owner,sequence,payload) VALUES (?,?,?)');
+  let sequence=Number(db.prepare('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE owner=?').get(owner).sequence);
+  for(const {id,command} of repairs){
+   const safeId=validId(id);
+   put.run(owner,safeId,JSON.stringify(envelope(command,key)));
+   event.run(owner,++sequence,JSON.stringify(envelope({type:'outcome-clear',id:safeId},key)));
+  }
  });
 }
 

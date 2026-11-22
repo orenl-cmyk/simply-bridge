@@ -6,6 +6,7 @@ import {prepareImport,materializeDependencies,nodeKey} from './import-plan.mjs';
 import {fetchRelations,verifyRelations,checkKey} from './relations.mjs';
 import {validateImportPreset} from './import-presets.mjs';
 import {applyImportMapping} from './public/import-mapping.js';
+import {repairRootCause,summarizeRepairGroups} from './public/repair-grouping.js';
 import http from 'node:http';
 import {readFile,writeFile,mkdir,rename} from 'node:fs/promises';
 import path from 'node:path';
@@ -17,7 +18,7 @@ import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
 import {writeSimply,executeRow} from './run.mjs';
 import {rateSnapshot,rateEtaSeconds,setConnectionRateCap,environmentKey,restoreEnvironmentRate} from './rate-limit.mjs';
 import {validatePreset} from './presets.mjs';
-import {queueRowRepair,finishRowRepair,saveSegmentedPlan,loadPlanMapping,loadPlanWork,loadPlanLinks,savePlanWork,finishPlanLink,importIdentityIndex,clearImportIdentities,clearImportKeys,saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
+import {queueRowRepair,queueRowRepairs,finishRowRepair,saveSegmentedPlan,loadPlanMapping,loadPlanWork,loadPlanLinks,savePlanWork,finishPlanLink,importIdentityIndex,clearImportIdentities,clearImportKeys,saveImportBatch,loadImportBatch,deleteImportBatch,saveWriteIntent,finishWriteIntent,saveRecoveryKey,loadRecoveryKey,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,appendDurableEvents,readDurableState,deleteDurableJob,deleteDurablePlan,deleteDurablePayload} from './job-store.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const appVersion=JSON.parse(await readFile(path.join(root,'package.json'),'utf8')).version;
@@ -645,10 +646,34 @@ async function runBackgroundImport(jobId,s,{finalize=true}={}){
  try{const concurrency=Math.min(Math.max(1,job.progress.total-(job.baseProgress.completed||0)-completed.size),connection.maxConcurrentRequests||3);await Promise.all(Array.from({length:concurrency},workerLoop));removeFinishedWrites(job);if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};if(finalize&&job.state!=='paused')job.finishedAt=Date.now();await storeJob(jobId,job,worker.key);}catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
 }
 const activeRowRepairs=new Set();
+const stalledRowRepairs=new Set(),rowRepairSessions=new Map();
+const maxQueuedRowRepairWorkers=8;
 
 function launchPendingRowRepairs(jobId,job,session){
- for(const command of job.pendingRowRepairs?.values()||[]){
-  void processRowRepair(jobId,job,command,session).catch(()=>console.error('Row repair interrupted',jobId));
+ if(session&&!rowRepairSessions.has(jobId)){
+  const connection=session.data.connections.find(item=>item.id===job.connectionId&&item.updatedAt===job.connectionVersion);
+  if(connection)rowRepairSessions.set(jobId,{key:Buffer.from(session.key),userId:job.ownerId,data:{connections:[structuredClone(connection)]}});
+ }
+ pumpQueuedRowRepairs();
+}
+
+function pumpQueuedRowRepairs(){
+ for(const [jobId,session] of rowRepairSessions){
+  const job=backgroundJobs.get(jobId);
+  if(!job){session.key.fill(0);rowRepairSessions.delete(jobId);continue;}
+  for(const command of job.pendingRowRepairs?.values()||[]){
+   if(activeRowRepairs.size>=maxQueuedRowRepairWorkers)return;
+   const taskId=jobId+':'+command.key;
+   if(activeRowRepairs.has(taskId)||stalledRowRepairs.has(taskId)||!runtimePlans.has(command.planId))continue;
+   void processRowRepair(jobId,job,command,session).then(()=>pumpQueuedRowRepairs(),error=>{
+    stalledRowRepairs.add(taskId);
+    console.error('Row repair interrupted',jobId);
+    pumpQueuedRowRepairs();
+   });
+  }
+  if(!job.pendingRowRepairs?.size&&! [...activeRowRepairs].some(taskId=>taskId.startsWith(jobId+':'))){
+   session.key.fill(0);rowRepairSessions.delete(jobId);
+  }
  }
 }
 
@@ -1070,7 +1095,8 @@ function artifactFor(ownerId,id,failedOnly=false){
  const rows=job.rows||[],selected=failedOnly?rows.filter(row=>row.status!=='succeeded'):rows;
  return {fileName:failedOnly?'simply-run-errors.json':'simply-run-report.json',value:{mode:'RUN',createdAt:new Date().toISOString(),job:{id,state:job.state,connectionName:job.connectionName,label:job.label,startedAt:job.startedAt,finishedAt:job.finishedAt,progress:job.progress,counts:job.counts,error:job.error,rateLimit:job.rateLimit},writeResults:selected}};
 }
-function repairIssues(s,{reportedOnly=false,status='',connectionId='',entity=''}={}){const issues=[];for(const [jobId,job] of backgroundJobs){if(job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))continue;if(connectionId&&job.connectionId!==connectionId)continue;for(const row of job.rows||[]){if(row.status==='succeeded')continue;if(reportedOnly&&!row.reportedAt)continue;if(status&&row.repairStatus!==status&&row.status!==status)continue;if(entity&&row.targetEntity!==entity&&row.entityName!==entity)continue;issues.push({issueId:jobId+'|'+row.planId+':'+row.index,jobId,key:row.planId+':'+row.index,ownerId:job.ownerId,username:job.username,connectionId:job.connectionId,connectionName:job.connectionName,jobLabel:job.label,jobStartedAt:job.startedAt,...row});}}return issues.sort((a,b)=>Date.parse(b.reportedAt||b.finishedAt||b.jobStartedAt)-Date.parse(a.reportedAt||a.finishedAt||a.jobStartedAt));}
+function repairIssues(s,{reportedOnly=false,status='',connectionId='',entity=''}={}){const issues=[];for(const [jobId,job] of backgroundJobs){if(job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))continue;if(connectionId&&job.connectionId!==connectionId)continue;for(const row of job.rows||[]){if(row.status==='succeeded'||row.repairStatus==='replanned')continue;if(reportedOnly&&!row.reportedAt)continue;if(status&&row.repairStatus!==status&&row.status!==status)continue;if(entity&&row.targetEntity!==entity&&row.entityName!==entity)continue;issues.push({issueId:jobId+'|'+row.planId+':'+row.index,jobId,key:row.planId+':'+row.index,ownerId:job.ownerId,username:job.username,connectionId:job.connectionId,connectionName:job.connectionName,jobLabel:job.label,jobStartedAt:job.startedAt,...row});}}return issues.sort((a,b)=>Date.parse(b.reportedAt||b.finishedAt||b.jobStartedAt)-Date.parse(a.reportedAt||a.finishedAt||a.jobStartedAt));}
+
 function findRepairIssue(s,issueId){const split=String(issueId||'').indexOf('|');if(split<1)throw fail(422,'מזהה התקלה אינו תקין.');const jobId=issueId.slice(0,split),key=issueId.slice(split+1),job=backgroundJobs.get(jobId);if(!job||job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))throw fail(404,'התקלה לא נמצאה.');const row=job.rows.find(item=>(item.planId+':'+item.index)===key);if(!row)throw fail(404,'התקלה לא נמצאה.');return {jobId,key,job,row};}
 async function api(req,res,url){
  const method=req.method;
@@ -1178,6 +1204,7 @@ async function api(req,res,url){
  }
  if(url==='/api/repairs/groups'&&method==='POST'){
   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const filter=await bodyOf(req);
   const groups=new Map();
   const add=(jobId,issue)=>{
    const groupId=issueGroupKey(issue),key=JSON.stringify([jobId,groupId]);
@@ -1197,10 +1224,149 @@ async function api(req,res,url){
    for(const row of job.rows||[])add(jobId,{kind:row.error?.kind||row.status,entity:row.targetEntity,
     message:row.error?.message||row.reasons?.join(' '),sourceId:row.sourceId});
   }
-  return send(res,200,{groups:[...groups.values()].slice(0,500),totalGroups:groups.size,expiresAt:s.last+ttl});
+  const rowGroups=summarizeRepairGroups(repairIssues(s,filter));
+  return send(res,200,{groups:[...groups.values()],totalGroups:groups.size,rowGroups,totalRowGroups:rowGroups.length,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/group-action'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req);
+  if(!['retry','close'].includes(b.action)||typeof b.groupId!=='string'||!Number.isSafeInteger(b.expectedCount)||b.expectedCount<1)throw fail(422,'בחירת קבוצת התקלות אינה תקינה.');
+  let selector;try{selector=JSON.parse(b.groupId);}catch{throw fail(422,'מזהה הקבוצה אינו תקין.');}
+  if(!Array.isArray(selector)||selector.length!==2||typeof selector[0]!=='string'||typeof selector[1]!=='string')throw fail(422,'מזהה הקבוצה אינו תקין.');
+  const [jobId,rootCauseKey]=selector,job=backgroundJobs.get(jobId);
+  if(!job||job.type!=='import_run')throw fail(404,'משימת הייבוא לא נמצאה.');
+  const rows=repairIssues(s,b).filter(issue=>issue.jobId===jobId&&repairRootCause(issue).key===rootCauseKey);
+  if(b.action==='retry'){
+   const candidates=rows.filter(issue=>['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed'&&!issue.semanticPreview);
+   if(candidates.length!==b.expectedCount)throw fail(409,'קבוצת החריגים השתנתה. רעננו את הסיכום ואשרו מחדש.');
+   if(candidates.some(issue=>job.pendingRowRepairs?.has(issue.key)))throw fail(409,'חלק מהשורות כבר נמצאות בתור תיקון. רעננו את הסיכום.');
+   const repairs=[];
+   for(const issue of candidates){
+    const plan=runtimePlans.get(issue.planId);
+    if(!plan||Date.now()-plan.createdAt>planTtl)throw fail(409,'אחת מתוכניות הכתיבה פגה. יש להריץ Dry Run ממוקד לפני Retry.');
+    const index=Number(issue.key.split(':').at(-1));
+    repairs.push({id:issue.key,command:{key:issue.key,planId:issue.planId,index,fromStatus:issue.status,partial:Boolean(issue.partial)}});
+   }
+   if(serviceKey)await saveRecoveryKey(directory,serviceKey,s.key);
+   await queueRowRepairs(directory,s.key,jobId,repairs);
+   job.pendingRowRepairs??=new Map();
+   for(const item of repairs){job.pendingRowRepairs.set(item.id,item.command);runtimeOutcomes.set(item.id,undefined);}
+   launchPendingRowRepairs(jobId,job,s);
+   return send(res,202,{scheduled:repairs.length,groupId:b.groupId,expiresAt:s.last+ttl});
+  }
+  const note=String(b.note||'').trim();
+  if(note.length<10||b.acknowledged!==true)throw fail(422,'סגירת קבוצה מחייבת תיעוד ואישור מפורש.');
+  const candidates=rows.filter(issue=>issue.repairStatus!=='closed');
+  if(candidates.length!==b.expectedCount)throw fail(409,'קבוצת החריגים השתנתה. רעננו את הסיכום ואשרו מחדש.');
+  if(!candidates.length)throw fail(409,'אין חריגים פתוחים בקבוצה.');
+  const closedAt=new Date().toISOString(),events=candidates.map(issue=>({type:'repair',key:issue.key,
+   meta:{repairStatus:'closed',closedAt,adminNote:note.slice(0,1000)}}));
+  await appendDurableEvents(directory,s.key,jobId,events);
+  for(const issue of candidates){
+   const row=job.rows.find(item=>item.planId+':'+item.index===issue.key);
+   if(row)Object.assign(row,{repairStatus:'closed',closedAt,adminNote:note.slice(0,1000)});
+  }
+  await storeJob(jobId,job,s.key);
+  return send(res,200,{closed:candidates.length,groupId:b.groupId,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/preview'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),issue=findRepairIssue(s,b.issueId),{jobId,key,job,row}=issue;
+  if(!['failed','not_sent'].includes(row.status)||row.repairStatus==='closed'||job.pendingRowRepairs?.has(key))throw fail(409,'אפשר לבצע Replan רק לשורה פתוחה שנכשלה בוודאות ואינה בטיפול.');
+  if(!Array.isArray(b.mapping)||!b.targetKey||typeof b.targetKey!=='object'||Array.isArray(b.targetKey))throw fail(422,'נדרש מיפוי ומפתח יעד חדשים.');
+  const oldPlan=runtimePlans.get(row.planId),connection=s.data.connections.find(item=>item.id===job.connectionId&&item.updatedAt===job.connectionVersion);
+  if(!oldPlan||!connection||Date.now()-oldPlan.createdAt>planTtl)throw fail(409,'התוכנית המקורית או החיבור פגו.');
+  const previousPreview=row.semanticPreview;
+  const oldIndex=Number(row.index),sourceRecord=row.sourceRecord|| (oldPlan.segmented?(await loadPlanWork(directory,s.key,row.planId,oldIndex))?.sourceRecord:oldPlan.sourceEntity.records[oldIndex]);
+  if(!sourceRecord)throw fail(409,'נתוני המקור של השורה אינם זמינים ל־Replan.');
+  const oldPlanned=oldPlan.segmented?(await loadPlanWork(directory,s.key,row.planId,oldIndex))?.planned:oldPlan.result.rows[oldIndex];
+  const sourceEntity={...oldPlan.sourceEntity,records:[structuredClone(sourceRecord)]};
+  const schemas=new Map([[connection.id+':'+connection.updatedAt,new Map([[oldPlan.targetId,oldPlan.schema]])]]);
+  const worker={...s,key:Buffer.from(s.key),data:{...s.data,activeId:connection.id},schemas};
+  try{
+   const prepared=await buildImportPreparation({s:worker,c:connection,includeLinks:Boolean(oldPlan.relationStaging),
+    b:{mappings:[{entity:sourceEntity,targetId:oldPlan.targetId,targetKey:b.targetKey,mapping:b.mapping,relationStaging:oldPlan.relationStaging}],
+     rules:runtimeInputs.get(job.inputId)?.rules||[]},guard:()=>{
+      const current=s.data.connections.find(item=>item.id===connection.id);
+      if(!current||current.updatedAt!==job.connectionVersion)throw fail(409,'החיבור השתנה במהלך ה־Replan.');
+     }});
+   const newPlanId=prepared.plans[0]?.id,newPlan=newPlanId&&runtimePlans.get(newPlanId);
+   const newWork=newPlan?.segmented?await loadPlanWork(directory,s.key,newPlanId,0):null;
+   const newRow=newWork?.planned||newPlan?.result.rows[0];
+   if(!newPlan||!newRow)throw fail(500,'לא נוצרה תוכנית Replan.');
+   newPlan.ownerId=job.ownerId;
+   await saveDurablePlan(directory,s.key,newPlanId,durablePlan(newPlan));
+   const conflicts=[...(newRow.status==='blocked'&&Array.isArray(newRow.reasons)?newRow.reasons:[])],warnings=[];
+   if(newRow.status!=='planned')conflicts.push(newRow.status==='skipped'?'לא נדרשת כתיבה לפי התוכנית החדשה.':'התוכנית החדשה אינה ניתנת לכתיבה.');
+   if(oldPlanned&&String(oldPlanned.matchKey)!==String(newRow.matchKey))warnings.push('מפתח המקור השתנה; יש לאמת שהרשומה המיועדת עדיין נכונה לפני אישור.');
+   if(oldPlanned&&oldPlanned.action!==newRow.action)warnings.push('סוג הפעולה השתנה מ־'+oldPlanned.action+' ל־'+newRow.action+'.');
+   const duplicateDestination=(job.planIds||[]).some(planId=>{
+    const other=runtimePlans.get(planId);
+    if(!other||other.targetId!==newPlan.targetId||JSON.stringify(other.targetKey)!==JSON.stringify(newPlan.targetKey))return false;
+    return other.result.rows.some((candidate,index)=>planId+':'+index!==key&&String(candidate.matchKey)===String(newRow.matchKey));
+   });
+   if(duplicateDestination)conflicts.push('קיימת רשומת מקור נוספת עם אותו מפתח הצלבה לישות ולשדה היעד שנבחרו.');
+   const oldMapping=oldPlan.segmented?await loadPlanMapping(directory,s.key,oldPlan.mappingId):oldPlan.mapping||[];
+   const newMapping=newPlan.segmented?await loadPlanMapping(directory,s.key,newPlan.mappingId):newPlan.mapping||[];
+   const token=randomUUID(),preview={id:randomUUID(),token,planId:newPlanId,index:0,oldPlanId:row.planId,oldIndex,
+    fromStatus:row.status,createdAt:Date.now(),conflicts,warnings};
+   row.semanticPreview=preview;
+   await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,meta:{semanticPreview:preview}});
+   await storeJob(jobId,job,s.key);
+   if(previousPreview?.planId){runtimePlans.delete(previousPreview.planId);await deleteDurablePlan(directory,previousPreview.planId);}
+   return send(res,200,{previewId:preview.id,token,issueId:b.issueId,
+    before:{targetKey:oldPlan.targetKey,mapping:oldMapping,status:row.status,action:oldPlanned?.action,targetId:oldPlanned?.targetId||null,matchKey:oldPlanned?.matchKey},
+    after:{targetKey:newPlan.targetKey,mapping:newMapping,status:newRow.status,action:newRow.action,targetId:newRow.targetId||null,matchKey:newRow.matchKey,reasons:newRow.reasons||[]},
+    conflicts,warnings,canApprove:conflicts.length===0,expiresAt:s.last+ttl});
+  }finally{worker.key.fill(0);}
+ }
+ if(url==='/api/repairs/replan/cancel'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),{jobId,key,job,row}=findRepairIssue(s,b.issueId),preview=row.semanticPreview;
+  if(!preview||preview.token!==b.token||job.pendingRowRepairs?.has(key))throw fail(409,'תצוגת ה־Replan אינה עדכנית.');
+  row.semanticPreview=null;
+  await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,meta:{semanticPreview:null}});
+  await storeJob(jobId,job,s.key);
+  runtimePlans.delete(preview.planId);await deleteDurablePlan(directory,preview.planId);
+  return send(res,200,{cancelled:true,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/details'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),{jobId,key,row}=findRepairIssue(s,b.issueId),preview=row.semanticPreview;
+  const oldPlan=preview&&runtimePlans.get(preview.oldPlanId),newPlan=preview&&runtimePlans.get(preview.planId);
+  if(!preview||!oldPlan||!newPlan)throw fail(409,'תוכנית ה־Replan אינה זמינה. בנו תצוגה חדשה.');
+  const oldRow=oldPlan.segmented?(await loadPlanWork(directory,s.key,preview.oldPlanId,preview.oldIndex))?.planned:oldPlan.result.rows[preview.oldIndex];
+  const newRow=newPlan.segmented?(await loadPlanWork(directory,s.key,preview.planId,preview.index))?.planned:newPlan.result.rows[preview.index];
+  const oldMapping=oldPlan.segmented?await loadPlanMapping(directory,s.key,oldPlan.mappingId):oldPlan.mapping||[];
+  const newMapping=newPlan.segmented?await loadPlanMapping(directory,s.key,newPlan.mappingId):newPlan.mapping||[];
+  return send(res,200,{previewId:preview.id,token:preview.token,issueId:b.issueId,
+   before:{targetKey:oldPlan.targetKey,mapping:oldMapping,status:preview.fromStatus,action:oldRow?.action,targetId:oldRow?.targetId||null,matchKey:oldRow?.matchKey},
+   after:{targetKey:newPlan.targetKey,mapping:newMapping,status:newRow?.status,action:newRow?.action,targetId:newRow?.targetId||null,matchKey:newRow?.matchKey,reasons:newRow?.reasons||[]},
+   conflicts:preview.conflicts||[],warnings:preview.warnings||[],canApprove:newRow?.status==='planned'&&!(preview.conflicts||[]).length,approved:Boolean(preview.approvedAt),expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/approve'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),{jobId,key,job,row}=findRepairIssue(s,b.issueId),preview=row.semanticPreview;
+  if(!preview||preview.token!==b.token||preview.fromStatus!==row.status||job.pendingRowRepairs?.has(key)||row.repairStatus==='closed')throw fail(409,'תצוגת ה־Replan אינה עדכנית. בצעו Replan מחדש.');
+  const plan=runtimePlans.get(preview.planId),planned=plan?.result.rows[preview.index];
+  if(!plan||!planned||planned.status!=='planned'||preview.conflicts?.length)throw fail(409,'התוכנית החדשה כוללת חסימות או התנגשות. יש לתקן ולתכנן מחדש.');
+  const connection=s.data.connections.find(item=>item.id===job.connectionId&&item.updatedAt===job.connectionVersion);
+  if(!connection)throw fail(409,'החיבור המקורי השתנה.');
+  const command={key,planId:preview.planId,index:preview.index,fromStatus:row.status,partial:false,semanticReplan:true};
+  if(serviceKey)await saveRecoveryKey(directory,serviceKey,s.key);
+  await queueRowRepair(directory,s.key,jobId,key,command);
+  row.semanticPreview={...preview,approvedAt:Date.now()};
+  (job.pendingRowRepairs??=new Map()).set(key,command);
+  runtimeOutcomes.set(key,undefined);
+  await storeJob(jobId,job,s.key);
+  launchPendingRowRepairs(jobId,job,s);
+  return send(res,202,{scheduled:1,previewId:preview.id,expiresAt:s.last+ttl});
  }
  if(url==='/api/repairs/list'&&method==='POST'){
-  const b=await bodyOf(req),rows=repairIssues(s,b),page=rows.slice(0,500);
+  const b=await bodyOf(req),rows=repairIssues(s,b);
+  const limit=Number(b.limit??100),offset=Number(b.offset??0);
+  if(!Number.isInteger(limit)||limit<1||limit>500||!Number.isInteger(offset)||offset<0)throw fail(422,'דפדוף התקלות אינו תקין.');
+  const page=rows.slice(offset,offset+limit);
   for(const row of page){
    const plan=runtimePlans.get(row.planId);
    if(!plan?.segmented)continue;
@@ -1211,7 +1377,7 @@ async function api(req,res,url){
     mapping:await loadPlanMapping(directory,s.key,plan.mappingId),
     writePayload:work.planned.request?.body,writePayloads:work.planned.requests});
   }
-  return send(res,200,{rows:page,totalRows:rows.length,truncated:rows.length>500,expiresAt:s.last+ttl});
+  return send(res,200,{rows:page,totalRows:rows.length,offset,limit,nextOffset:offset+page.length<rows.length?offset+page.length:null,expiresAt:s.last+ttl});
  }
  if(url==='/api/repairs/action'&&method==='POST'){
   const b=await bodyOf(req),ids=Array.isArray(b.issueIds)?b.issueIds:[b.issueId];if(!ids.length||ids.length>500)throw fail(422,'יש לבחור בין תקלה אחת ל־500 תקלות.');const results=[];
@@ -1220,6 +1386,7 @@ async function api(req,res,url){
    if(b.action==='retry'){
     const existing=job.pendingRowRepairs?.get(key);
     if(existing){results.push({issueId,...await processRowRepair(jobId,job,existing,s)});continue;}
+    if(row.semanticPreview)throw fail(409,'קיימת תצוגת Replan פתוחה. אשרו אותה או בטלו אותה לפני Retry.');
     if(!['failed','not_sent'].includes(row.status))throw fail(409,'תוצאה לא ידועה מחייבת אימות יעד לפני ניסיון חוזר; ניתן לסגור ידנית לאחר האימות.');
     const [planId,indexText]=key.split(':'),index=Number(indexText),plan=runtimePlans.get(planId);
     if(!plan||Date.now()-plan.createdAt>planTtl)throw fail(409,'תוכנית הכתיבה אינה זמינה. יש להפעיל Dry Run חדש לתיקון ממוקד.');
@@ -1497,7 +1664,7 @@ async function api(req,res,url){
  }else throw fail(404,'הפעולה לא נמצאה.');
  await commit(s,next);send(res,200,publicData(s));
 }
-const assets={'/import-file.js':['import-file.js','text/javascript; charset=utf-8'],'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/operations-ui.js':['operations-ui.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
+const assets={'/import-file.js':['import-file.js','text/javascript; charset=utf-8'],'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/operations-ui.js':['operations-ui.js','text/javascript; charset=utf-8'],'/repair-grouping.js':['repair-grouping.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
 const server=http.createServer((req,res)=>{
  res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'");
  const run=async()=>{try{

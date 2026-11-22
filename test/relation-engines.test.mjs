@@ -95,6 +95,27 @@ test('BLACK resolver scopes hierarchy and inventory, excludes archive and select
  assert.deepEqual(updated,{baseId:'base1',buildingId:'a',floorId:'',roomId:'',inventoryId:'item'});
 });
 
+test('BLACK resolver omits unresolved fields after an Origami API failure instead of clearing them',async()=>{
+ const config=validateBlackConfig({connectionId:'black',issueEntity:'issue',
+  source:{base:'base',building:'building',floor:'floor',room:'room',topic:'topic',item:'item'},
+  destination:{base:'baseId',building:'buildingId',floor:'floorId',room:'roomId',inventory:'inventoryId'},
+  base:{entity:'base',name:'name'},building:{entity:'building',name:'name',base:'base'},
+  floor:{entity:'floor',name:'name',building:'building'},room:{entity:'room',name:'name',floor:'floor'},
+  catalog:{entity:'catalog',name:'name',topic:'topic'},
+  inventory:{entity:'inventory',base:'base',building:'building',floor:'floor',topic:'topic',catalog:'catalog'}
+ });
+ let written;
+ const result=await resolveBlackIssue({config,connection:{},issueId:'i',
+  read:async(_connection,_operation,params)=>{
+   if(params.entity_data_name==='issue')return records(instance('i',{base:'Base',building:'B',floor:'F',room:'R',item:'Item',topic:'T'}));
+   throw Error('Origami returned HTTP 200 with an error object');
+  },
+  write:async({fields})=>{written=fields;return {status:'verified'};}
+ });
+ assert.ok(result.issues.some(issue=>issue.kind==='technical_failure'));
+ assert.deepEqual(written,[], 'an API error must not authorize clearing existing destination relations');
+});
+
 test('relation write verifies set equality from the update result',async()=>{
  let reads=0,writes=0;
  const result=await writeRelations({connection:{},entity:'e',id:'r',fields:[{fieldId:'links',index:0,multi:true,value:['a','b']}],

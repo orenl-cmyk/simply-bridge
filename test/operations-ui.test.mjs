@@ -48,7 +48,9 @@ test('import exposes one visible run action and active-job resume wiring',async(
 
 test('admin repair UI groups causes and requires a documented exception close',async()=>{
  const app=await readFile(path.join(root,'public/app.js'),'utf8');
- assert.match(app,/groupRepairIssues\(rows\)/);assert.match(app,/רשומות מושפעות/);assert.match(app,/parseCorrectedPayloads/);
- assert.match(app,/data-close-note/);assert.match(app,/data-close-ack/);assert.match(app,/action='close'/);
- assert.match(app,/group\.retryableRecords&&!group\.incomplete/);assert.match(app,/open&&!group\.incomplete/);
+ assert.match(app,/repairs\/groups/);assert.match(app,/סיכום מלא לפי שורש בעיה/);assert.match(app,/parseCorrectedPayloads/);
+ assert.match(app,/data-close-note/);assert.match(app,/data-close-ack/);assert.match(app,/acknowledged:true/);
+ assert.match(app,/repairs\/group-action/);assert.match(app,/expectedCount/);
+ assert.match(app,/repairs\/replan\/preview/);assert.match(app,/repairs\/replan\/approve/);
+ assert.match(app,/data-repair-page/);
 });

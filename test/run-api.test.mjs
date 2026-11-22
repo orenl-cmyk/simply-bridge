@@ -184,18 +184,67 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  }
  const conflict=(await call('repairs/list',{})).rows.find(row=>row.jobId===existingTarget.jobId);
  assert.ok(conflict);
+ const semanticPreview=await call('repairs/replan/preview',{issueId:conflict.issueId,
+  targetKey:{kind:'field',groupId:'g',fieldId:'title'},mapping:conflict.mapping||[]});
+ assert.equal(semanticPreview.status,200);
+ assert.equal(semanticPreview.canApprove,true);
+ assert.equal((await call('repairs/action',{action:'retry',issueId:conflict.issueId})).status,409,
+  'old plan retry is blocked while semantic preview is pending');
+ const semanticCancel=await call('repairs/replan/cancel',{issueId:conflict.issueId,token:semanticPreview.token});
+ assert.equal(semanticCancel.cancelled,true,JSON.stringify(semanticCancel));
  rows.set('repair-existing0',{_id:'existing-target',field_groups:[{
   field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:'repair-existing0'},
-   {field_data_name:'title',value:'other values'}]]
+   {field_data_name:'title',value:'repair-existing0'}]]
  }]});
  const beforeRepair=writes.length;
  const guarded=await call('repairs/action',{action:'retry',issueId:conflict.issueId});
  assert.equal(guarded.results[0].status,'not_sent');
  assert.equal(writes.length,beforeRepair);
- const undocumentedClose=await call('repairs/action',{action:'close',issueId:conflict.issueId,note:'short'});
- assert.equal(undocumentedClose.status,422);
- const documentedClose=await call('repairs/action',{action:'close',issueId:conflict.issueId,note:'נבדק יעד קיים; נדרש טיפול ידני.'});
- assert.equal(documentedClose.results[0].status,'closed');
+ const approvedReplan=await call('repairs/replan/preview',{issueId:conflict.issueId,
+  targetKey:{kind:'field',groupId:'g',fieldId:'external'},mapping:[{sourceGroup:'g',targetGroup:'g',fields:[{sourceField:'title',targetField:'title'}]}]});
+ assert.equal(approvedReplan.status,200,JSON.stringify(approvedReplan));
+ assert.equal(approvedReplan.after.action,'update',JSON.stringify(approvedReplan));
+ assert.equal(approvedReplan.canApprove,true);
+ const replanAccepted=await call('repairs/replan/approve',{issueId:conflict.issueId,token:approvedReplan.token});
+ assert.equal(replanAccepted.status,202);
+ let replanStatus;
+ for(let i=0;i<100;i++){
+  replanStatus=await call('import/run/status',{jobId:existingTarget.jobId});
+  if(replanStatus.outcome==='completed')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(replanStatus.outcome,'completed');
+ assert.equal(writes.length,beforeRepair+1,'approved semantic plan performs one new write');
+ assert.equal(writes.at(-1).body.filter?.[0]?.[2],'existing-target');
+ assert.ok(!(await call('repairs/list',{})).rows.some(row=>row.issueId===conflict.issueId));
+ const largeFailure=await call('import/pipeline/start',{connectionId:c,schemaVersion:'1.0',batches:[
+  {...relationMapping,entity:entity(Array(501).fill('bad'),'group-over-500')}
+ ]});
+ assert.equal(largeFailure.status,202);
+ let largeFailureStatus;
+ for(let i=0;i<200;i++){
+  largeFailureStatus=await call('import/run/status',{jobId:largeFailure.jobId});
+  if(largeFailureStatus.state!=='running')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(largeFailureStatus.outcome,'completed_with_gaps');
+ const serverGroups=await call('repairs/groups',{});
+ const largeGroup=serverGroups.rowGroups.find(group=>group.jobId===largeFailure.jobId);
+ assert.equal(largeGroup.affectedRecords,501);
+ assert.equal(largeGroup.closeableRecords,501);
+ const bulkRetryWrites=writes.length;
+ const queuedLargeRetry=await call('repairs/group-action',{action:'retry',groupId:largeGroup.groupId,expectedCount:501});
+ assert.equal(queuedLargeRetry.status,202);
+ assert.equal(queuedLargeRetry.scheduled,501);
+ for(let i=0;i<800&&writes.length<bulkRetryWrites+501;i++)await new Promise(r=>setTimeout(r,25));
+ assert.equal(writes.length,bulkRetryWrites+501,'server schedules the entire group through the bounded repair queue');
+ const afterBulkRetry=(await call('repairs/groups',{})).rowGroups.find(group=>group.jobId===largeFailure.jobId);
+ assert.equal(afterBulkRetry.retryableRecords,501);
+ assert.equal((await call('repairs/group-action',{action:'close',groupId:largeGroup.groupId,
+  expectedCount:501,note:'קצר',acknowledged:true})).status,422);
+ const closedLargeGroup=await call('repairs/group-action',{action:'close',groupId:largeGroup.groupId,
+  expectedCount:501,note:'נבדקו כל הרשומות בקבוצה זו.',acknowledged:true});
+ assert.equal(closedLargeGroup.closed,501);
  if(loadRows){
   const parts=[JSON.stringify({connectionId:c,schemaVersion:'1.0'})+'\n'];
   for(let offset=0;offset<loadRows;offset+=500){
