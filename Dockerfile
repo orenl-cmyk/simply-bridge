@@ -1,7 +1,7 @@
 ARG NODE_IMAGE=node:22-bookworm-slim
 FROM ${NODE_IMAGE}
 LABEL org.opencontainers.image.title="SIMPLY BRIDGE" \
-      org.opencontainers.image.version="0.23.0" \
+      org.opencontainers.image.version="0.24.0-dev.1" \
       org.opencontainers.image.description="Local SIMPLY data transfer bridge"
 WORKDIR /app
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=4318 DATA_DIR=/app/data
