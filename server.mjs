@@ -11,7 +11,7 @@ import http from 'node:http';
 import {readFile,writeFile,mkdir,rename} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {randomBytes,randomUUID,scryptSync,createCipheriv,createDecipheriv,timingSafeEqual} from 'node:crypto';
+import {createHash,randomBytes,randomUUID,scryptSync,createCipheriv,createDecipheriv,timingSafeEqual} from 'node:crypto';
 import {readOrigami,normalizeEntities,normalizeStructure,excludedEntity} from './origami.mjs';
 import {exportEntity,createPackage} from './transfer.mjs';
 import {dateRange,exportParams,verifyWindow,dryRunEntity} from './sync.mjs';
@@ -208,10 +208,26 @@ async function hydrateDurable(s,{recover=false}={}){
      job.relationCompleted++;
      if(event.issues.length)job.relationIssues.push(...event.issues);
     }
+    if(event.type==='group-replan-approved'&&job.groupReplans?.[event.groupReplanId]){
+     Object.assign(job.groupReplans[event.groupReplanId],{status:'approved',approvedAt:event.approvedAt,approvedBy:event.approvedBy,
+      fingerprint:event.fingerprint,approvedMemberCount:event.memberCount,oldRule:event.oldRule,newRule:event.newRule});
+    }
    }
    const completed=new Set();
    for(const event of events()){if(event.type!=='progress'||!activeRow(event.key)||completed.has(event.key))continue;completed.add(event.key);job.completedKeys.push(event.key);job.counts[event.status]=(job.counts[event.status]||0)+1;if(event.row&&event.status!=='succeeded')job.rows.push(event.row);job.progress.completed++;job.progress.apiRequestsCompleted+=Number(event.apiRequests)||0;}
-   for(const event of events()){if(event.type!=='repair')continue;const index=job.rows.findIndex(row=>(row.planId+':'+row.index)===event.key);if(index>=0){if(event.row?.status==='succeeded')job.rows.splice(index,1);else job.rows[index]={...job.rows[index],...event.row,...event.meta};}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}}
+   const rowsByKey=new Map(job.rows.map(row=>[row.planId+':'+row.index,row])),completedRepairs=new Set(),previewRecordsById=new Map();
+   for(const [previewId,preview] of Object.entries(job.groupReplans||[]))previewRecordsById.set(previewId,new Map((preview.records||[]).map(record=>[record.key,record])));
+   for(const event of events()){if(event.type!=='repair')continue;const row=rowsByKey.get(event.key);if(row){if(event.row?.status==='succeeded')completedRepairs.add(row);else Object.assign(row,event.row,event.meta);}if(event.fromStatus&&event.row?.status&&event.fromStatus!==event.row.status){job.counts[event.fromStatus]=Math.max(0,(job.counts[event.fromStatus]||0)-1);job.counts[event.row.status]=(job.counts[event.row.status]||0)+1;}if(event.meta?.groupReplanId&&job.groupReplans?.[event.meta.groupReplanId]){const record=previewRecordsById.get(event.meta.groupReplanId)?.get(event.key);if(record&&event.meta.groupReplanOutcome)record.outcome=event.meta.groupReplanOutcome;}}
+   if(completedRepairs.size)job.rows=job.rows.filter(row=>!completedRepairs.has(row));
+   for(const preview of Object.values(job.groupReplans||{})){
+    if(preview.status==='building'){
+     preview.status='interrupted';preview.error='השרת הופעל מחדש במהלך חישוב ה־Preview. יש לבנות Preview חדש לפני אישור.';
+     const resets=[];for(const member of preview.members||[]){const row=rowsByKey.get(member.key);if(row?.semanticPreview?.groupReplanId===preview.id){row.semanticPreview=null;resets.push({type:'repair',key:member.key,meta:{semanticPreview:null}});}}
+     if(resets.length)await appendDurableEvents(directory,s.key,id,resets);
+     for(const record of preview.records||[])if(record.planId){runtimePlans.delete(record.planId);await deleteDurablePlan(directory,record.planId);}
+    }
+    preview.summary=summarizeGroupReplan(preview);
+   }
    removeFinishedWrites(job);
    if(job.state==='completed_with_gaps'&&!hasImportGaps(job))job.state='done';
    job.progress.percent=job.progress.total?Math.floor(job.progress.completed*100/job.progress.total):100;
@@ -665,7 +681,10 @@ function pumpQueuedRowRepairs(){
    if(activeRowRepairs.size>=maxQueuedRowRepairWorkers)return;
    const taskId=jobId+':'+command.key;
    if(activeRowRepairs.has(taskId)||stalledRowRepairs.has(taskId)||!runtimePlans.has(command.planId))continue;
-   void processRowRepair(jobId,job,command,session).then(()=>pumpQueuedRowRepairs(),error=>{
+   void processRowRepair(jobId,job,command,session).then(result=>{
+    if(result?.status==='pending'){stalledRowRepairs.add(taskId);return;}
+    pumpQueuedRowRepairs();
+   },error=>{
     stalledRowRepairs.add(taskId);
     console.error('Row repair interrupted',jobId);
     pumpQueuedRowRepairs();
@@ -689,8 +708,10 @@ async function processRowRepair(jobId,job,command,session){
  try{
   const result=(await executePlanRow(worker,{planId:command.planId,index:command.index})).row;
   const {responses,completedRequests,recoveryRequests,...row}=result;
-  const meta={repairStatus:row.status==='succeeded'?'resolved':'retry_failed',retriedAt:new Date().toISOString()};
+  const groupReplanId=command.groupReplanId,meta={repairStatus:row.status==='succeeded'?'resolved':'retry_failed',retriedAt:new Date().toISOString(),...(groupReplanId?{groupReplanId,groupReplanOutcome:row.status}:{})};
   const event={type:'repair',key:command.key,fromStatus:command.fromStatus,row:{...row,planId:command.planId,index:command.index},meta};
+  const groupReplan=groupReplanId&&job.groupReplans?.[groupReplanId];
+  if(groupReplan){const record=groupReplan.records.find(item=>item.key===command.key);if(record)record.outcome=row.status;groupReplan.summary=summarizeGroupReplan(groupReplan);}
   await finishRowRepair(directory,worker.key,jobId,command.key,event);
   const index=job.rows.findIndex(row=>row.planId+':'+row.index===command.key);
   if(index>=0){
@@ -1097,7 +1118,92 @@ function artifactFor(ownerId,id,failedOnly=false){
 }
 function repairIssues(s,{reportedOnly=false,status='',connectionId='',entity=''}={}){const issues=[];for(const [jobId,job] of backgroundJobs){if(job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))continue;if(connectionId&&job.connectionId!==connectionId)continue;for(const row of job.rows||[]){if(row.status==='succeeded'||row.repairStatus==='replanned')continue;if(reportedOnly&&!row.reportedAt)continue;if(status&&row.repairStatus!==status&&row.status!==status)continue;if(entity&&row.targetEntity!==entity&&row.entityName!==entity)continue;issues.push({issueId:jobId+'|'+row.planId+':'+row.index,jobId,key:row.planId+':'+row.index,ownerId:job.ownerId,username:job.username,connectionId:job.connectionId,connectionName:job.connectionName,jobLabel:job.label,jobStartedAt:job.startedAt,...row});}}return issues.sort((a,b)=>Date.parse(b.reportedAt||b.finishedAt||b.jobStartedAt)-Date.parse(a.reportedAt||a.finishedAt||a.jobStartedAt));}
 
+function repairGroupSelector(groupId){let selector;try{selector=JSON.parse(groupId);}catch{throw fail(422,'מזהה הקבוצה אינו תקין.');}if(!Array.isArray(selector)||selector.length!==2||typeof selector[0]!=='string'||typeof selector[1]!=='string')throw fail(422,'מזהה הקבוצה אינו תקין.');return {jobId:selector[0],rootCauseKey:selector[1]};}
+const repairGroupSnapshot=rows=>rows.map(row=>({key:row.key,status:row.status,repairStatus:row.repairStatus||'',planId:row.planId,index:Number(row.index),sourceId:row.sourceId||'',targetEntity:row.targetEntity||'',errorKind:row.error?.kind||'',errorField:row.error?.details?.column?.[0]?.field_data_name||''})).sort((a,b)=>a.key.localeCompare(b.key));
+const repairGroupFingerprint=rows=>createHash('sha256').update(JSON.stringify(repairGroupSnapshot(rows))).digest('hex');
+function summarizeGroupReplan(preview){
+ const rows=preview.records||[],counts={total:rows.length,readyToWrite:0,stillExceptions:0,alreadySatisfied:0,conflicts:0,technical:0,keyChanges:0,actionChanges:0,writesSucceeded:0,writesFailed:0,writesPending:0};
+ const actions={};
+ for(const row of rows){
+  if(row.outcome==='succeeded'){counts.writesSucceeded++;continue;}
+  if(row.outcome==='already_satisfied'){counts.alreadySatisfied++;continue;}
+  if(row.outcome==='blocked'){counts.stillExceptions++;continue;}
+  if(row.outcome){counts.writesFailed++;counts.stillExceptions++;continue;}
+  if(row.conflicts?.length){counts.conflicts++;counts.stillExceptions++;}
+  else if(preview.status==='approved'&&row.status==='planned')counts.writesPending++;
+  else if(row.status==='planned'){counts.readyToWrite++;actions[row.newAction||'unknown']=(actions[row.newAction||'unknown']||0)+1;}
+  else if(row.status==='skipped')counts.alreadySatisfied++;
+  else {counts.stillExceptions++;if(row.status==='preview_error')counts.technical++;}
+  if(row.keyChanged)counts.keyChanges++;
+  if(row.actionChanged)counts.actionChanges++;
+ }
+ return {counts,actions,conflictSamples:rows.filter(row=>row.conflicts?.length).slice(0,25).map(row=>({sourceId:row.sourceId,reason:row.conflicts[0]})),warningSamples:rows.filter(row=>row.keyChanged||row.actionChanged).slice(0,25).map(row=>({sourceId:row.sourceId,keyChanged:row.keyChanged,actionChanged:row.actionChanged,oldAction:row.oldAction,newAction:row.newAction}))};
+}
+
 function findRepairIssue(s,issueId){const split=String(issueId||'').indexOf('|');if(split<1)throw fail(422,'מזהה התקלה אינו תקין.');const jobId=issueId.slice(0,split),key=issueId.slice(split+1),job=backgroundJobs.get(jobId);if(!job||job.type!=='import_run'||(s.role!=='admin'&&job.ownerId!==s.userId))throw fail(404,'התקלה לא נמצאה.');const row=job.rows.find(item=>(item.planId+':'+item.index)===key);if(!row)throw fail(404,'התקלה לא נמצאה.');return {jobId,key,job,row};}
+
+async function runGroupReplanPreview(jobId,previewId,session,connection){
+ const job=backgroundJobs.get(jobId),preview=job?.groupReplans?.[previewId];if(!job||!preview||preview.status!=='building')return;
+ const rowsByKey=new Map(job.rows.map(row=>[row.planId+':'+row.index,row]));
+ const worker={...session,key:Buffer.from(session.key),data:{...session.data,activeId:connection.id},schemas:new Map([[connection.id+':'+connection.updatedAt,new Map()]])};
+ try{
+  const eligibleKeys=new Set(preview.members.map(member=>member.key)),existingKeys=new Set(),targetKeyText=JSON.stringify(preview.newRule.targetKey);
+  for(const [planId,other] of runtimePlans){
+   if(other.targetId!==preview.scope.targetId||JSON.stringify(other.targetKey)!==targetKeyText)continue;
+   for(let index=0;index<(other.result?.rows||[]).length;index++){
+    const candidate=other.result.rows[index];if(candidate?.matchKey===undefined||eligibleKeys.has(planId+':'+index))continue;
+    const collisionKey=JSON.stringify([other.targetId,targetKeyText,String(candidate.matchKey)]);
+    existingKeys.add(collisionKey);
+   }
+  }
+  const generatedKeys=new Map(),events=[];
+  for(let cursor=0;cursor<preview.members.length;cursor++){
+   if(preview.status!=='building')return;
+   const member=preview.members[cursor],original=rowsByKey.get(member.key);
+   const result={...member,conflicts:[],status:'preview_error'};
+   try{
+    const oldPlan=runtimePlans.get(member.planId);
+    if(!oldPlan)throw Error('תוכנית המקור אינה זמינה.');
+    const oldWork=oldPlan.segmented?await loadPlanWork(directory,worker.key,member.planId,member.index):null;
+    const sourceRecord=oldWork?.sourceRecord??oldPlan.sourceEntity.records?.[member.index];
+    const oldPlanned=oldWork?.planned??oldPlan.result.rows?.[member.index];
+    if(!sourceRecord||!oldPlanned)throw Error('נתוני המקור של הרשומה אינם זמינים.');
+    worker.schemas.get(connection.id+':'+connection.updatedAt).set(oldPlan.targetId,oldPlan.schema);
+    const sourceEntity={...oldPlan.sourceEntity,records:[structuredClone(sourceRecord)]};
+    const prepared=await buildImportPreparation({s:worker,c:connection,includeLinks:Boolean(oldPlan.relationStaging),
+     b:{mappings:[{entity:sourceEntity,targetId:oldPlan.targetId,targetKey:preview.newRule.targetKey,
+      mapping:preview.newRule.mapping,relationStaging:oldPlan.relationStaging}],rules:runtimeInputs.get(job.inputId)?.rules||[]},
+     guard:()=>{const current=session.data.connections.find(item=>item.id===connection.id);if(!current||current.updatedAt!==job.connectionVersion)throw fail(409,'החיבור השתנה במהלך Replan.');}});
+    const planId=prepared.plans[0]?.id,plan=planId&&runtimePlans.get(planId),work=plan?.segmented?await loadPlanWork(directory,worker.key,planId,0):null;
+    const planned=work?.planned||plan?.result.rows?.[0];
+    if(!plan||!planned)throw Error('לא נוצרה תוכנית Replan לרשומה.');
+    plan.ownerId=job.ownerId;await saveDurablePlan(directory,worker.key,planId,durablePlan(plan));
+    const collisionKey=JSON.stringify([plan.targetId,JSON.stringify(plan.targetKey),String(planned.matchKey)]);
+    if(existingKeys.has(collisionKey))result.conflicts.push('מפתח ההצלבה כבר משויך לרשומה אחרת בתוכנית העבודה.');
+    const groupKey=collisionKey;
+    if(!generatedKeys.has(groupKey))generatedKeys.set(groupKey,[]);generatedKeys.get(groupKey).push(result);
+    result.planId=planId;result.index=0;result.status=planned.status;result.targetId=planned.targetId||null;
+    result.matchKey=planned.matchKey;result.oldAction=oldPlanned.action;result.newAction=planned.action;
+    result.keyChanged=String(oldPlanned.matchKey)!==String(planned.matchKey)||JSON.stringify(oldPlan.targetKey)!==JSON.stringify(plan.targetKey);
+    result.actionChanged=oldPlanned.action!==planned.action;result.reasons=planned.reasons||[];
+    if(planned.status==='blocked')result.conflicts.push(...(planned.reasons||['תוכנית היעד חסומה.']));
+    else if(!['planned','skipped'].includes(planned.status))result.conflicts.push('מצב התכנון אינו ניתן לכתיבה.');
+   }catch(error){result.status='preview_error';result.conflicts.push(error.status===409?'החיבור השתנה במהלך תכנון הקבוצה.':'לא ניתן לתכנן רשומה זו: '+String(error.message||'שגיאת תכנון').slice(0,300));}
+   preview.records.push(result);
+   preview.progress.completed=cursor+1;
+   if((cursor+1)%20===0){preview.summary=summarizeGroupReplan(preview);await storeJob(jobId,job,worker.key);}
+  }
+  for(const duplicates of generatedKeys.values())if(duplicates.length>1)for(const item of duplicates)item.conflicts.push('התנגשות: כמה רשומות בקבוצה מתוכננות לאותו מפתח יעד.');
+  preview.summary=summarizeGroupReplan(preview);preview.status='ready';preview.finishedAt=Date.now();
+  for(const member of preview.members){const row=rowsByKey.get(member.key);if(row)row.semanticPreview={groupReplanId:preview.id,state:'ready'};events.push({type:'repair',key:member.key,meta:{semanticPreview:{groupReplanId:preview.id,state:'ready'}}});}
+  await appendDurableEvents(directory,worker.key,jobId,events);await storeJob(jobId,job,worker.key);
+ }catch(error){
+  preview.status='failed';preview.error=String(error.message||'לא ניתן לחשב את התוכנית הקבוצתית.').slice(0,500);preview.finishedAt=Date.now();
+  const events=[];for(const member of preview.members){const row=rowsByKey.get(member.key);if(row)row.semanticPreview={groupReplanId:preview.id,state:'failed'};events.push({type:'repair',key:member.key,meta:{semanticPreview:{groupReplanId:preview.id,state:'failed'}}});}
+  await appendDurableEvents(directory,worker.key,jobId,events);await storeJob(jobId,job,worker.key);
+ }finally{worker.key.fill(0);}
+}
+
 async function api(req,res,url){
  const method=req.method;
  if(['/api/issues/resolve','/api/issues/status'].includes(url))return blackIssueApi(req,res,url);
@@ -1224,8 +1330,125 @@ async function api(req,res,url){
    for(const row of job.rows||[])add(jobId,{kind:row.error?.kind||row.status,entity:row.targetEntity,
     message:row.error?.message||row.reasons?.join(' '),sourceId:row.sourceId});
   }
-  const rowGroups=summarizeRepairGroups(repairIssues(s,filter));
+  const rowIssues=repairIssues(s,filter),rowGroups=summarizeRepairGroups(rowIssues);
+  for(const group of rowGroups){
+   const first=rowIssues.find(issue=>issue.jobId===group.jobId&&repairRootCause(issue).key===group.rootCauseKey&&['failed','not_sent'].includes(issue.status)&&!issue.semanticPreview);
+   const plan=first&&runtimePlans.get(first.planId);
+   if(plan){
+    group.jobId=first.jobId;
+    group.replanTemplate={targetKey:plan.targetKey,mapping:plan.segmented?await loadPlanMapping(directory,s.key,plan.mappingId):plan.mapping||[]};
+   }
+  }
   return send(res,200,{groups:[...groups.values()],totalGroups:groups.size,rowGroups,totalRowGroups:rowGroups.length,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/group-start'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),{jobId,rootCauseKey}=repairGroupSelector(b.groupId),job=backgroundJobs.get(jobId);
+  if(!job||job.type!=='import_run')throw fail(404,'משימת הייבוא לא נמצאה.');
+  if(!Array.isArray(b.mapping)||!b.targetKey||typeof b.targetKey!=='object'||Array.isArray(b.targetKey)||!Number.isSafeInteger(b.expectedCount)||b.expectedCount<1)throw fail(422,'נדרשים מיפוי, מפתח יעד ומספר רשומות צפוי תקינים.');
+  const issues=repairIssues(s,b).filter(issue=>issue.jobId===jobId&&repairRootCause(issue).key===rootCauseKey);
+  const candidates=issues.filter(issue=>['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed'&&
+   (!issue.semanticPreview||issue.semanticPreview.replanBlocked===true));
+  if(candidates.length!==b.expectedCount)throw fail(409,'קבוצת החריגים השתנתה. רעננו את הסיכום לפני Preview.');
+  if(candidates.some(issue=>job.pendingRowRepairs?.has(issue.key)))throw fail(409,'חלק מהרשומות כבר נמצאות בתור תיקון.');
+  if(candidates.some(issue=>issue.semanticPreview&&!issue.semanticPreview.replanBlocked))throw fail(409,'יש לבטל Preview קודם לפני התחלת Replan קבוצתי חדש.');
+  const firstPlan=runtimePlans.get(candidates[0].planId);
+  if(!firstPlan)throw fail(409,'תוכנית המקור אינה זמינה.');
+  const connection=s.data.connections.find(item=>item.id===job.connectionId&&item.updatedAt===job.connectionVersion);
+  if(!connection)throw fail(409,'החיבור המקורי אינו זמין.');
+  const oldMapping=firstPlan.segmented?await loadPlanMapping(directory,s.key,firstPlan.mappingId):firstPlan.mapping||[];
+  const scope={targetId:firstPlan.targetId,targetKey:firstPlan.targetKey,mapping:oldMapping,
+   sourceName:firstPlan.sourceEntity?.meta?.dataName,relationStaging:firstPlan.relationStaging||null};
+  for(const issue of candidates){
+   const plan=runtimePlans.get(issue.planId);
+   const mapping=plan?.segmented?await loadPlanMapping(directory,s.key,plan.mappingId):plan?.mapping||[];
+   const actual={targetId:plan?.targetId,targetKey:plan?.targetKey,mapping,sourceName:plan?.sourceEntity?.meta?.dataName,relationStaging:plan?.relationStaging||null};
+   if(!plan||JSON.stringify(actual)!==JSON.stringify(scope))throw fail(409,'קבוצת שורש הבעיה כוללת תוכניות או מיפויים שונים. סננו לפי קבוצה אחידה ונסו שוב.');
+  }
+  const members=candidates.map(issue=>({key:issue.key,planId:issue.planId,index:Number(issue.index),status:issue.status,sourceId:issue.sourceId||''}));
+  const previewId=randomUUID(),preview={id:previewId,jobId,groupId:b.groupId,rootCauseKey,ownerId:s.userId,status:'building',
+   token:randomUUID(),fingerprint:repairGroupFingerprint(candidates),expectedCount:candidates.length,members,records:[],oldRule:scope,
+   scope,newRule:{targetKey:structuredClone(b.targetKey),mapping:structuredClone(b.mapping)},
+   progress:{completed:0,total:candidates.length},createdAt:Date.now(),summary:null};
+  job.groupReplans??={};job.groupReplans[previewId]=preview;
+  const rowsByKey=new Map(job.rows.map(row=>[row.planId+':'+row.index,row])),events=[];
+  for(const issue of candidates){const row=rowsByKey.get(issue.key);row.semanticPreview={groupReplanId:previewId,state:'building'};events.push({type:'repair',key:issue.key,meta:{semanticPreview:{groupReplanId:previewId,state:'building'}}});}
+  try{await appendDurableEvents(directory,s.key,jobId,events);await storeJob(jobId,job,s.key);}
+  catch(error){for(const issue of candidates){const row=rowsByKey.get(issue.key);if(row)row.semanticPreview=null;}delete job.groupReplans[previewId];throw error;}
+  runGroupReplanPreview(jobId,previewId,s,connection).catch(()=>{});
+  return send(res,202,{previewId,state:'building',total:candidates.length,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/group-status'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId),preview=job?.groupReplans?.[b.previewId];
+  if(!preview)throw fail(404,'תצוגת ה־Replan הקבוצתית לא נמצאה.');
+  const conflictOffset=Number.isSafeInteger(b.conflictOffset)&&b.conflictOffset>=0?b.conflictOffset:0;
+  const conflictLimit=Number.isSafeInteger(b.conflictLimit)?Math.max(1,Math.min(100,b.conflictLimit)):25;
+  const allConflicts=(preview.records||[]).filter(record=>record.conflicts?.length);
+  const status=preview.status==='approved'?(preview.summary?.counts?.writesPending?'running':'completed'):preview.status;
+  return send(res,200,{previewId:preview.id,jobId:preview.jobId,status,error:preview.error||null,
+   progress:preview.progress,summary:preview.summary,before:preview.oldRule||preview.scope,
+   after:preview.newRule,warning:JSON.stringify(preview.scope.targetKey)!==JSON.stringify(preview.newRule.targetKey)?'מפתח ההצלבה השתנה. יש לבדוק את ההשפעה ולאשר במפורש.':null,
+   conflicts:preview.summary?.conflictSamples||[],conflictPage:{offset:conflictOffset,limit:conflictLimit,total:allConflicts.length,records:allConflicts.slice(conflictOffset,conflictOffset+conflictLimit).map(record=>({sourceId:record.sourceId,key:record.key,reasons:record.conflicts,oldAction:record.oldAction,newAction:record.newAction}))},warnings:preview.summary?.warningSamples||[],token:preview.token,
+   canApprove:preview.status==='ready'&&Boolean(preview.token),approvedAt:preview.approvedAt||null,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/group-cancel'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId),preview=job?.groupReplans?.[b.previewId];
+  if(!preview||preview.status==='approved'||(preview.status==='ready'&&preview.token!==b.token))throw fail(409,'לא ניתן לבטל Preview שאושר או שאינו עדכני.');
+  const rowsByKey=new Map(job.rows.map(row=>[row.planId+':'+row.index,row])),events=[];
+  for(const member of preview.members){const row=rowsByKey.get(member.key);if(row?.semanticPreview?.groupReplanId===preview.id){row.semanticPreview=null;events.push({type:'repair',key:member.key,meta:{semanticPreview:null}});}}
+  preview.status='cancelled';preview.cancelledAt=Date.now();
+  await appendDurableEvents(directory,s.key,b.jobId,events);await storeJob(b.jobId,job,s.key);
+  for(const record of preview.records){if(record.planId){runtimePlans.delete(record.planId);await deleteDurablePlan(directory,record.planId);}}
+  return send(res,200,{cancelled:true,expiresAt:s.last+ttl});
+ }
+ if(url==='/api/repairs/replan/group-approve'&&method==='POST'){
+  if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId),preview=job?.groupReplans?.[b.previewId];
+  if(!preview||preview.status!=='ready'||preview.token!==b.token)throw fail(409,'תוכנית הקבוצה אינה זמינה או שהאישור פג.');
+  const current=repairIssues(s).filter(issue=>issue.jobId===b.jobId&&repairRootCause(issue).key===preview.rootCauseKey&&
+   ['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed');
+  if(current.length!==preview.expectedCount)throw fail(409,'מספר הרשומות בקבוצה השתנה מאז ה־Preview ('+current.length+' במקום '+preview.expectedCount+'). יש לחשב ולאשר תוכנית חדשה.');
+  if(repairGroupFingerprint(current)!==preview.fingerprint)throw fail(409,'פרטי הרשומות בקבוצה השתנו מאז ה־Preview. יש לחשב ולאשר תוכנית חדשה.');
+  if(current.some(issue=>issue.semanticPreview?.groupReplanId!==preview.id))throw fail(409,'חברות הרשומות ב־Preview השתנתה. יש לחשב ולאשר תוכנית חדשה.');
+  if(current.some(issue=>job.pendingRowRepairs?.has(issue.key)))throw fail(409,'רשומה בקבוצה נכנסה לתור תיקון. יש לחשב ולאשר תוכנית חדשה.');
+  const recordsByKey=new Map(preview.records.map(record=>[record.key,record]));
+  if(preview.members.some(member=>!recordsByKey.has(member.key)))throw fail(409,'תצוגת הקבוצה אינה שלמה.');
+  const connection=s.data.connections.find(item=>item.id===job.connectionId&&item.updatedAt===job.connectionVersion);
+  if(!connection)throw fail(409,'החיבור המקורי השתנה.');
+  const approvedAt=Date.now(),commands=[],auditEvents=[],resolved=[],rowsByKey=new Map(job.rows.map(row=>[row.planId+':'+row.index,row]));
+  for(const record of preview.records){
+   const row=rowsByKey.get(record.key);
+   if(record.status==='planned'&&!record.conflicts.length){
+    commands.push({id:record.key,command:{key:record.key,planId:record.planId,index:record.index,fromStatus:row.status,partial:false,semanticReplan:true,groupReplanId:preview.id}});
+   }else if(record.status==='skipped'&&!record.conflicts.length){
+    const resolvedRow={status:'succeeded',targetId:record.targetId,reconciled:true,semanticReplan:true,sourceId:row.sourceId,matchKey:record.matchKey,action:record.newAction,planId:record.planId,index:record.index};
+    auditEvents.push({type:'repair',key:record.key,fromStatus:row.status,row:resolvedRow,meta:{repairStatus:'resolved',groupReplanId:preview.id,groupReplanOutcome:'already_satisfied',approvedAt}});
+    resolved.push({row,fromStatus:row.status,result:resolvedRow});record.outcome='already_satisfied';
+   }else{
+    const blockedPreview={groupReplanId:preview.id,state:'approved_blocked',replanBlocked:true,approvedAt};
+    auditEvents.push({type:'repair',key:record.key,meta:{semanticPreview:blockedPreview,groupReplanId:preview.id,groupReplanOutcome:'blocked'}});
+    record.outcome='blocked';
+   }
+  }
+  auditEvents.push({type:'group-replan-approved',groupReplanId:preview.id,approvedAt,approvedBy:s.userId,
+   fingerprint:preview.fingerprint,memberCount:preview.members.length,oldRule:preview.scope,newRule:preview.newRule});
+  if(serviceKey)await saveRecoveryKey(directory,serviceKey,s.key);
+  await queueRowRepairs(directory,s.key,b.jobId,commands,{auditEvents});
+  preview.status='approved';preview.approvedAt=approvedAt;preview.approvedBy=s.userId;
+  const scheduledKeys=new Set(commands.map(item=>item.id));
+  for(const record of preview.records){
+   const row=rowsByKey.get(record.key);if(!row)continue;
+   if(scheduledKeys.has(record.key))row.semanticPreview={groupReplanId:preview.id,approvedAt};
+   else if(record.outcome==='blocked')row.semanticPreview={groupReplanId:preview.id,state:'approved_blocked',replanBlocked:true,approvedAt};
+  }
+  preview.summary=summarizeGroupReplan(preview);
+  job.pendingRowRepairs??=new Map();
+  for(const item of commands){job.pendingRowRepairs.set(item.id,item.command);runtimeOutcomes.set(item.id,undefined);}
+  for(const item of resolved){const index=job.rows.indexOf(item.row);if(index>=0)job.rows.splice(index,1);job.counts[item.fromStatus]=Math.max(0,(job.counts[item.fromStatus]||0)-1);job.counts.succeeded=(job.counts.succeeded||0)+1;runtimeOutcomes.set(preview.id+':'+item.result.index,item.result);}
+  launchPendingRowRepairs(b.jobId,job,s);await storeJob(b.jobId,job,s.key);
+  return send(res,202,{approved:true,scheduled:commands.length,resolvedWithoutWrite:resolved.length,blocked:preview.summary.counts.stillExceptions,previewId:preview.id,expiresAt:s.last+ttl});
  }
  if(url==='/api/repairs/group-action'&&method==='POST'){
   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');

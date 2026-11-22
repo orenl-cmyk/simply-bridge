@@ -261,7 +261,7 @@ export async function queueRowRepair(directory,key,jobId,id,command){
  return queueRowRepairs(directory,key,jobId,[{id,command}]);
 }
 
-export async function queueRowRepairs(directory,key,jobId,repairs){
+export async function queueRowRepairs(directory,key,jobId,repairs,{auditEvents=[]}={}){
  const db=await store(directory,key),owner=validId(jobId);
  transaction(db,()=>{
   const put=db.prepare('INSERT INTO row_repairs VALUES (?,?,?)');
@@ -272,6 +272,7 @@ export async function queueRowRepairs(directory,key,jobId,repairs){
    put.run(owner,safeId,JSON.stringify(envelope(command,key)));
    event.run(owner,++sequence,JSON.stringify(envelope({type:'outcome-clear',id:safeId},key)));
   }
+  for(const value of auditEvents)event.run(owner,++sequence,JSON.stringify(envelope(value,key)));
  });
 }
 

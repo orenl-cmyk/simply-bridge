@@ -85,7 +85,7 @@ test('BLACK resolver scopes hierarchy and inventory, excludes archive and select
  };
  const queries=[];
  let updated;
- await resolveBlackIssue({config,connection:{},issueId:'i',
+ const result=await resolveBlackIssue({config,connection:{},issueId:'i',
   read:async(_connection,_operation,params)=>{queries.push(params);return records(...data[params.entity_data_name]);},
   write:async({fields})=>{updated=Object.fromEntries(fields.map(field=>[field.fieldId,field.value]));}
  });
@@ -93,6 +93,7 @@ test('BLACK resolver scopes hierarchy and inventory, excludes archive and select
  assert.ok(!queries.some(query=>query.entity_data_name==='room'));
  assert.deepEqual(queries.find(query=>query.entity_data_name==='inventory').filter,[['building','=','a'],['topic','=','T'],['catalog','=','cat']]);
  assert.deepEqual(updated,{baseId:'base1',buildingId:'a',floorId:'',roomId:'',inventoryId:'item'});
+ assert.ok(result.issues.some(issue=>issue.kind==='duplicates'&&issue.role==='building'));
 });
 
 test('BLACK resolver omits unresolved fields after an Origami API failure instead of clearing them',async()=>{

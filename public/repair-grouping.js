@@ -18,9 +18,9 @@ export function summarizeRepairGroups(issues=[]){
   const cause=repairRootCause(issue),groupId=JSON.stringify([issue.jobId,cause.key]);
   let group=groups.get(groupId);
   if(!group){group={groupId,jobId:issue.jobId,rootCauseKey:cause.key,title:cause.title,detail:cause.detail,
-   connectionName:issue.connectionName||'',jobLabel:issue.jobLabel||'',affectedRecords:0,retryableRecords:0,closeableRecords:0};groups.set(groupId,group);}
+   connectionName:issue.connectionName||'',jobLabel:issue.jobLabel||'',affectedRecords:0,retryableRecords:0,replanableRecords:0,closeableRecords:0};groups.set(groupId,group);}
   group.affectedRecords++;
-  if(['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed'&&!issue.semanticPreview)group.retryableRecords++;
+  if(['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed'&&!issue.semanticPreview){group.retryableRecords++;group.replanableRecords++;}
   if(issue.repairStatus!=='closed')group.closeableRecords++;
  }
  return [...groups.values()].sort((a,b)=>b.affectedRecords-a.affectedRecords||a.title.localeCompare(b.title,'he'));

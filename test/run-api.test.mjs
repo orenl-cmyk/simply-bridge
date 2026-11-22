@@ -4,8 +4,8 @@ import {test} from 'node:test';import assert from 'node:assert/strict';import ht
 const loadRows=Number(process.env.BRIDGE_TEST_IMPORT_ROWS)||0;
 const root=fileURLToPath(new URL('../',import.meta.url));
 test('RUN creates, skips validation failure and continues; replay is idempotent; unknown writes survive restart and block repeats',async()=>{
- const rows=new Map(),writes=[];let serial=0,storedBeforeReply,dryProbe,dryReleased,repairStored,releaseRepair;const mock=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const b=JSON.parse(text);res.setHeader('content-type','application/json');if(req.url.includes('entity_structure'))return res.end(JSON.stringify({field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'title',field_type_name:'input-text'},{field_data_name:'external',field_type_name:'input-text'},{field_data_name:'link',field_type_name:'select-from-entity'},{field_data_name:'relation_json',field_type_name:'textarea'}]]}]}));if(req.url.includes('instance_data')){const value=b.filter[0][2];if(['dry-restart0','pipeline-third0','pipeline1','compact-second0','mixed-checkpoint0'].includes(value)&&dryProbe){const started=dryProbe;dryProbe=null;started();await dryReleased;}if(b.filter[0][1]==='in'){const matches=[...new Set(value)].flatMap(k=>rows.has(k)?[rows.get(k)]:[]);return res.end(JSON.stringify({info:{total_count:matches.length},data:matches.map(instance_data=>({instance_data}))}));}const r=b.filter[0][0]==='_id'?[...rows.values()].find(row=>row._id===value):rows.get(value);return res.end(JSON.stringify({info:{total_count:r?1:0},data:r?[{instance_data:r}]:[]}));}
- writes.push({url:req.url,body:b});const form=b.form_data?.[0]?.data[0];if(form?.title==='slow')await new Promise(r=>setTimeout(r,50));if(form?.title==='bad')return res.end(JSON.stringify({error:{type:'validation',column:[{field_data_name:'title',message:'invalid value'}]}}));if(form?.title==='timeout'){req.socket.destroy();return;}
+ const rows=new Map(),writes=[];let serial=0,storedBeforeReply,dryProbe,dryReleased,repairStored,releaseRepair,bulkTargetWritten,releaseBulkReply,releaseBulkReplyFn,bulkHeldKey;const mock=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const b=JSON.parse(text);res.setHeader('content-type','application/json');if(req.url.includes('entity_structure'))return res.end(JSON.stringify({field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'title',field_type_name:'input-text'},{field_data_name:'external',field_type_name:'input-text'},{field_data_name:'link',field_type_name:'select-from-entity'},{field_data_name:'relation_json',field_type_name:'textarea'}]]}]}));if(req.url.includes('instance_data')){const value=b.filter[0][2];if(['dry-restart0','pipeline-third0','pipeline1','compact-second0','mixed-checkpoint0'].includes(value)&&dryProbe){const started=dryProbe;dryProbe=null;started();await dryReleased;}if(b.filter[0][1]==='in'){const matches=[...new Set(value)].flatMap(k=>rows.has(k)?[rows.get(k)]:[]);return res.end(JSON.stringify({info:{total_count:matches.length},data:matches.map(instance_data=>({instance_data}))}));}const r=b.filter[0][0]==='_id'?[...rows.values()].find(row=>row._id===value):rows.get(value);return res.end(JSON.stringify({info:{total_count:r?1:0},data:r?[{instance_data:r}]:[]}));}
+ const form=b.form_data?.[0]?.data[0];writes.push({url:req.url,body:b});if(bulkTargetWritten){const reached=bulkTargetWritten;bulkTargetWritten=null;bulkHeldKey=form?.external||'update';reached();await releaseBulkReply;}if(form?.title==='slow')await new Promise(r=>setTimeout(r,50));if(form?.external==='bulk-replan-500'&&!form.title)return res.end(JSON.stringify({error:{type:'validation',column:[{field_data_name:'external',message:'selected failure'}]}}));if(form?.title==='bad')return res.end(JSON.stringify({error:{type:'validation',column:[{field_data_name:'title',message:'invalid value'}]}}));if(form?.title==='timeout'){req.socket.destroy();return;}
  if(req.url.includes('create_instance')){const id='created-'+(++serial);rows.set(form.external,{_id:id,field_groups:[{field_group_data:{group_data_name:'g'},fields_data:[[{field_data_name:'external',value:form.external}]]}]});if(['restart after write','repair saved before reply'].includes(form.title)){rows.get(form.external).field_groups[0].fields_data[0].push({field_data_name:'title',value:form.title});storedBeforeReply();await new Promise(r=>setTimeout(r,500));}return res.end(JSON.stringify({success:'ok',results:{_id:id}}));}const updated=[...rows.values()].find(row=>row._id===b.filter?.[0]?.[2]);if(updated&&b.field){for(const [field_data_name,value] of b.field){const fields=updated.field_groups[0].fields_data[0];const cell=fields.find(field=>field.field_data_name===field_data_name);if(cell)cell.value=value;else fields.push({field_data_name,value});}}if(repairStored&&b.field?.some(([field,value])=>field==='link'&&value==='replacement')){
   const settled=repairStored;
   repairStored=null;
@@ -20,7 +20,7 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const call=async(route,body)=>{const r=await fetch(origin+'/api/'+route,{method:'POST',headers:{origin,'content-type':body instanceof Blob?body.type:'application/json',cookie},body:body instanceof Blob?body:JSON.stringify(body)});if(r.headers.get('set-cookie'))cookie=r.headers.get('set-cookie').split(';')[0];return {status:r.status,...await r.json()};};
  const entity=(values,prefix='key')=>({meta:{dataName:'users',name:'משתמשי אפליקציה'},records:values.map((title,i)=>({id:'source'+i,matchKey:prefix+i,data:{g:[{title}]}}))});let c;
  const plan=async(e,mapping)=>{const r=await call('import/dry-run',{connectionId:c,schemaVersion:'1.0',entity:e,mapping,targetId:'appUsers',targetKey:{kind:'field',groupId:'g',fieldId:'external'}});assert.equal(r.status,200);return r;};
- try{await launch();const page=await (await fetch(origin+'/')).text(),manifest=JSON.parse(await readFile(path.join(root,'package.json'),'utf8'));assert.match(page,new RegExp('SIMPLY BRIDGE · v'+manifest.version.replaceAll('.','\\.')));assert.equal(page.includes('__APP_VERSION__'),false);assert.equal((await call('import/run',{planId:'fake',index:0})).status,401);await call('setup',{username:'admin',password:'test-password-123'});c=(await call('connections',{name:'test',maxConcurrentRequests:1,maxRequestsPerSecond:0,maxRequestsPerHour:0,username:'demo',secret:'demo-secret',baseUrl:`http://127.0.0.1:${mock.address().port}`})).connections[0].id;await call('select',{id:c});await call('schema/structure',{connectionId:c,entityId:'appUsers'});
+ try{await launch();const page=await (await fetch(origin+'/')).text(),manifest=JSON.parse(await readFile(path.join(root,'package.json'),'utf8'));assert.match(page,new RegExp('SIMPLY BRIDGE · v'+manifest.version.replaceAll('.','\\.')));assert.equal(page.includes('__APP_VERSION__'),false);assert.equal((await call('import/run',{planId:'fake',index:0})).status,401);await call('setup',{username:'admin',password:'test-password-123'});c=(await call('connections',{name:'test',maxConcurrentRequests:1,maxRequestsPerSecond:1000,maxRequestsPerHour:0,username:'demo',secret:'demo-secret',baseUrl:`http://127.0.0.1:${mock.address().port}`})).connections[0].id;await call('select',{id:c});await call('schema/structure',{connectionId:c,entityId:'appUsers'});
  const presetBody={connectionId:c,name:'test import',sourceScope:'black',rules:[{sourceId:'users',targetId:'appUsers',targetKey:{kind:'field',groupId:'g',fieldId:'external'},mapping:[{sourceGroup:'g',targetGroup:'g',fields:[{sourceField:'title',targetField:'title'}]}]}]};const savedPreset=await call('import-presets/save',presetBody);assert.equal(savedPreset.status,200);assert.equal(savedPreset.presets.length,1);assert.equal((await call('import-presets/list',{connectionId:c,sourceScope:'other'})).presets.length,0);
  const p=await plan(entity(['good','bad','good']));assert.equal(writes.length,0);let results=[];for(let index=0;index<3;index++){const r=await call('import/run',{planId:p.planId,index});assert.equal(r.status,200);results.push(r.row);}
  assert.deepEqual(results.map(r=>r.status),['succeeded','failed','succeeded']);assert.equal(results[1].stop,false);assert.equal(results[1].sourceRecord.data.g[0].title,'bad');assert.equal(results[1].sourceEntityMeta.name,'משתמשי אפליקציה');assert.equal(results[1].error.details.column[0].field_data_name,'title');assert.equal(writes.length,3);assert.equal(writes[0].body.form_data[0].data[0].external,'key0');
@@ -245,6 +245,78 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const closedLargeGroup=await call('repairs/group-action',{action:'close',groupId:largeGroup.groupId,
   expectedCount:501,note:'נבדקו כל הרשומות בקבוצה זו.',acknowledged:true});
  assert.equal(closedLargeGroup.closed,501);
+ const bulkReplanJob=await call('import/pipeline/start',{connectionId:c,schemaVersion:'1.0',batches:[
+  {...relationMapping,entity:entity(Array(1000).fill('bad'),'bulk-replan-')}
+ ]});
+ assert.equal(bulkReplanJob.status,202);
+ let bulkRunStatus;
+ for(let i=0;i<1200;i++){
+  bulkRunStatus=await call('import/run/status',{jobId:bulkReplanJob.jobId});
+  if(bulkRunStatus.state!=='running')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(bulkRunStatus.counts.failed,1000);
+ const bulkGroups=(await call('repairs/groups',{})).rowGroups;
+ const bulkGroup=bulkGroups.find(group=>group.jobId===bulkReplanJob.jobId);
+ assert.equal(bulkGroup.retryableRecords,1000);
+ const groupCorrectedMapping=[{sourceGroup:'g',targetGroup:'g',fields:[{sourceField:'title',targetField:'external'}]}];
+ const startBulkPreview=await call('repairs/replan/group-start',{jobId:bulkReplanJob.jobId,groupId:bulkGroup.groupId,
+  expectedCount:1000,targetKey:{kind:'field',groupId:'g',fieldId:'title'},mapping:groupCorrectedMapping});
+ assert.equal(startBulkPreview.status,202);
+ const groupStatus=async previewId=>call('repairs/replan/group-status',{jobId:bulkReplanJob.jobId,previewId});
+ let bulkPreview;
+ for(let i=0;i<1500;i++){
+  bulkPreview=await groupStatus(startBulkPreview.previewId);
+  if(bulkPreview.status!=='building')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(bulkPreview.status,'ready');
+ assert.equal(bulkPreview.summary.counts.total,1000);
+ assert.match(bulkPreview.warning,/מפתח ההצלבה השתנה/,'a valid target-key change is surfaced as a warning');
+ const firstPage=await call('repairs/list',{limit:100});
+ const toClose=firstPage.rows.find(row=>row.jobId===bulkReplanJob.jobId&&row.matchKey==='bulk-replan-0');
+ assert.ok(toClose);
+ assert.equal((await call('repairs/action',{action:'close',issueId:toClose.issueId,note:'נבדק לפני אישור הקבוצה.'})).results[0].status,'closed');
+ assert.equal((await call('repairs/replan/group-approve',{jobId:bulkReplanJob.jobId,previewId:startBulkPreview.previewId,token:bulkPreview.token})).status,409,
+  'membership changes after preview must invalidate approval');
+ assert.equal((await call('repairs/replan/group-cancel',{jobId:bulkReplanJob.jobId,previewId:startBulkPreview.previewId,token:bulkPreview.token})).cancelled,true);
+ const refreshedGroup=(await call('repairs/groups',{})).rowGroups.find(group=>group.jobId===bulkReplanJob.jobId);
+ assert.equal(refreshedGroup.replanableRecords,999);
+ const confirmedPreview=await call('repairs/replan/group-start',{jobId:bulkReplanJob.jobId,groupId:refreshedGroup.groupId,
+  expectedCount:999,targetKey:{kind:'field',groupId:'g',fieldId:'external'},mapping:groupCorrectedMapping});
+ let confirmedStatus;
+ for(let i=0;i<1500;i++){
+  confirmedStatus=await groupStatus(confirmedPreview.previewId);
+  if(confirmedStatus.status!=='building')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(confirmedStatus.status,'ready');
+ assert.equal(confirmedStatus.summary.counts.readyToWrite,999);
+ assert.equal(confirmedStatus.conflictPage.total,confirmedStatus.summary.counts.conflicts);
+ const writesBeforeBulkApprove=writes.length;
+ const heldTargetWrite=new Promise(resolve=>{bulkTargetWritten=resolve;});
+ releaseBulkReply=new Promise(resolve=>{releaseBulkReplyFn=resolve;});
+ const bulkApproval=await call('repairs/replan/group-approve',{jobId:bulkReplanJob.jobId,previewId:confirmedPreview.previewId,token:confirmedStatus.token});
+ assert.equal(bulkApproval.status,202,JSON.stringify(bulkApproval));
+ await heldTargetWrite;
+ await stop();
+ releaseBulkReplyFn();
+ cookie='';
+ await launch();
+ await call('unlock',{username:'admin',password:'test-password-123'});
+ let recoveredReplan;
+ for(let i=0;i<1600;i++){
+  recoveredReplan=await groupStatus(confirmedPreview.previewId);
+  if(recoveredReplan.status==='completed')break;
+  await new Promise(r=>setTimeout(r,25));
+ }
+ assert.equal(recoveredReplan.status,'completed');
+ assert.equal(recoveredReplan.summary.counts.writesSucceeded,998);
+ assert.equal(recoveredReplan.summary.counts.writesFailed,1);
+ assert.equal(recoveredReplan.summary.counts.readyToWrite,0);
+ assert.equal(recoveredReplan.summary.counts.stillExceptions,1);
+ assert.equal(writes.length-writesBeforeBulkApprove,999,
+  'each approved replan is attempted once; the in-flight write is reconciled after restart');
  if(loadRows){
   const parts=[JSON.stringify({connectionId:c,schemaVersion:'1.0'})+'\n'];
   for(let offset=0;offset<loadRows;offset+=500){
