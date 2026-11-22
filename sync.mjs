@@ -30,7 +30,7 @@ export async function dryRunEntity({connection,entity,targetId,targetKey,schema,
  const rows=[];let processedRecords=0;const totalRecords=entity.records.length;
  for(const record of entity.records){
   guard();const key=targetKey.kind==='recordId'?'_id':targetKey.fieldId,value=record.matchKey;
-  const search={entity_data_name:targetId,filter:[[key,'=',value]],limit:[0,2]};
+  const search={entity_data_name:targetId,filter:[[key,'=',value]],limit:[0,2],with_archive:1};
   const raw=await read(connection,'instance_data',search,onDebug,guard);guard();
   if(!Array.isArray(raw.data))bad('תשובת חיפוש לא מוכרת.');
   const matches=raw.data.map(x=>x.instance_data),total=Number(raw.info?.total_count??matches.length),reasons=[],warnings=[];

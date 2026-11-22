@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {classifyOrigamiResult} from '../origami-result.mjs';
 import {executeRow} from '../run.mjs';
+import {rateState} from '../rate-limit.mjs';
 
 test('HTTP 200 max_api_calls is a rate limit and pauses a row without recording a permanent failure',async()=>{
  const classified=classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'max_api_calls',message:'Hourly quota reached'}}});
@@ -14,4 +15,22 @@ test('HTTP 200 max_api_calls is a rate limit and pauses a row without recording 
 test('validation and authorization bodies remain distinct from hourly quota errors',()=>{
  assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'validation',message:'required'}}}).kind,'validation');
  assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'permission',message:'denied'}}}).kind,'authorization');
+});
+
+test('explicit uniqueness errors differ from an uncertain server response',()=>{
+ assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'validation',code:'unique_violation'}}}).kind,'uniqueness');
+ const server=classifyOrigamiResult({status:502,data:{error:{type:'validation'}}});
+ assert.equal(server.kind,'system');
+ assert.equal(server.definiteRejection,false);
+});
+
+test('connections targeting the same environment share the strictest observed quota',()=>{
+ const baseUrl='https://shared.invalid/bridge';
+ const first=rateState({id:'first',baseUrl,maxRequestsPerSecond:6,maxRequestsPerHour:300});
+ const second=rateState({id:'second',baseUrl:baseUrl+'/',maxRequestsPerSecond:10,maxRequestsPerHour:500});
+ const other=rateState({id:'other',baseUrl:'https://other.invalid/bridge'});
+ assert.equal(first,second);
+ assert.equal(second.effectiveRps,6);
+ assert.equal(second.configuredHourly,300);
+ assert.notEqual(first,other);
 });

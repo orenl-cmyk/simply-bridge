@@ -19,6 +19,8 @@ export async function writeSimply(connection,operation,params,onDebug=()=>{},gua
    const text=await response.text();let data;try{data=JSON.parse(text);}catch{}
    debug.response={status:response.status,headers:Object.fromEntries(['retry-after','date'].map(k=>[k,response.headers.get(k)]).filter(([,v])=>v!==null)),bodyPreview:JSON.stringify(redact(data??text)).slice(0,12000)};
    const classified=classifyOrigamiResult({status:response.status,data,responseOk:response.ok});
+   if(classified.kind==='uniqueness')throw fail('uniqueness','Origami דחתה את הכתיבה בגלל אילוץ ייחודיות.',redact(classified.error));
+   if(classified.kind==='system'&&!classified.definiteRejection)throw fail('unknown','Origami החזירה שגיאת שרת אחרי שליחת הכתיבה.',redact(classified.error));
    if(classified.kind==='validation')throw fail('validation','הרשומה נדחתה בוולידציה של SIMPLY.',redact(classified.error));
    if(classified.kind==='rate_limit')throw Object.assign(fail('rate_limit','SIMPLY הגבילה את קצב הבקשות. הקצב יופחת והריצה תמתין.',redact(classified.error??data)),{pauseMs:retryDelay(response)});
    if(classified.kind==='authorization')throw fail('authorization','הבקשה נדחתה בהרשאה. בדקו את משתמש ה־API והמפתח בחיבור.',redact(classified.error??data));
@@ -42,8 +44,8 @@ export async function executeRow({planned,write,recordIntent,recordResult,reconc
  let result,completed=[];
  try{let targetId=planned.targetId;for(const step of sequence(planned)){const response=await write(planned,step);targetId=response.targetId||targetId;completed.push({operation:step.operation,response:response.response});}result={sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId,status:'succeeded',sent:true,stop:false,responses:completed,warnings:planned.warnings};}
  catch(e){
-  if(e.kind==='unknown'&&reconcile)try{result=await reconcile({planned,completed,error:e});}catch(reconcileError){result={sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:planned.targetId,status:'unknown',sent:true,partial:completed.length>0,completedRequests:completed,stop:false,error:{message:'לא ניתן להכריע אם הכתיבה בוצעה: '+reconcileError.message,details:e.details}};}
-  else {const deferred=['rate_limit','authorization','system'].includes(e.kind);result={sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:planned.targetId,status:deferred?'deferred':e.kind==='validation'||e.kind==='api_error'?'failed':'unknown',sent:deferred?false:e.kind!=='rate_limit',partial:completed.length>0,completedRequests:completed,stop:deferred,error:{kind:e.kind||'unknown',message:e.message,details:e.details}};}
+  if((e.kind==='unknown'||(e.kind==='uniqueness'&&planned.action==='create'&&!completed.length))&&reconcile)try{result=await reconcile({planned,completed,error:e});}catch(reconcileError){result={sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:planned.targetId,status:'unknown',sent:true,partial:completed.length>0,completedRequests:completed,stop:false,error:{message:'לא ניתן להכריע אם הכתיבה בוצעה: '+reconcileError.message,details:e.details}};}
+  else {const deferred=['rate_limit','authorization','system'].includes(e.kind);result={sourceId:planned.sourceId,matchKey:planned.matchKey,action:planned.action,targetId:planned.targetId,status:deferred?'deferred':e.kind==='validation'||e.kind==='api_error'||e.kind==='uniqueness'?'failed':'unknown',sent:deferred?false:e.kind!=='rate_limit',partial:completed.length>0,completedRequests:completed,stop:deferred,error:{kind:e.kind||'unknown',message:e.message,details:e.details}};}
  }
  await recordResult(result);return result;
 }

@@ -8,7 +8,7 @@
     "test": "node --preserve-symlinks --preserve-symlinks-main --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   }
 }
 

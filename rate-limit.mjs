@@ -22,7 +22,12 @@ const states=new Map(),connectionCaps=new Map();
 export function setConnectionRateCap(id,requestsPerSecond){
  connectionCaps.set(id,requestsPerSecond);
 }
-const connectionKey=connection=>String(connection?.id||connection?.baseUrl||'default');
+export function environmentKey(connection){
+ if(!connection?.baseUrl)return String(connection?.id||'default');
+ return connection.baseUrl.replace(/\/+$/,'');
+}
+const connectionKey=environmentKey;
+const restrict=(left,right)=>left&&right?Math.min(left,right):left||right;
 function configured(connection){
  const configuredRps=Number.isFinite(Number(connection?.maxRequestsPerSecond))?Math.max(0,Number(connection.maxRequestsPerSecond)):10;
  const hourly=Number.isFinite(Number(connection?.maxRequestsPerHour))?Math.max(0,Math.floor(Number(connection.maxRequestsPerHour))):5000;
@@ -34,8 +39,11 @@ function configured(connection){
 export function rateState(connection){
  const key=connectionKey(connection),settings=configured(connection);let state=states.get(key);
  if(!state){state={limiter:createLimiter(),configuredRps:settings.rps,effectiveRps:settings.rps,configuredHourly:settings.hourly,maxConcurrent:settings.maxConcurrent,rateLimitHits:0,lastRateLimitAt:null};states.set(key,state);}
- if(state.configuredRps!==settings.rps){state.configuredRps=settings.rps;state.effectiveRps=settings.rps;}
- state.configuredHourly=settings.hourly;state.maxConcurrent=settings.maxConcurrent;return state;
+ state.configuredRps=restrict(state.configuredRps,settings.rps);
+ state.effectiveRps=restrict(state.effectiveRps,state.configuredRps);
+ state.configuredHourly=restrict(state.configuredHourly,settings.hourly);
+ state.maxConcurrent=Math.min(state.maxConcurrent,settings.maxConcurrent);
+ return state;
 }
 export function rateOptions(connection){const state=rateState(connection),spacingMs=state.effectiveRps>0?Math.ceil(1000/state.effectiveRps):0;return {state,spacingMs,maxConcurrent:state.maxConcurrent,maxRequestsPerHour:state.configuredHourly};}
 export function noteRateLimit(connection,pauseMs){const state=rateState(connection),base=state.effectiveRps>0?state.effectiveRps:(state.configuredRps>0?state.configuredRps:100);state.effectiveRps=Math.max(1,Math.floor(base/2));state.rateLimitHits++;state.lastRateLimitAt=new Date().toISOString();state.limiter.pause(pauseMs);return rateSnapshot(connection);}
