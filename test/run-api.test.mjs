@@ -66,6 +66,16 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  }
  assert.equal(pipelineStatus.state,'done');
  assert.equal(pipelineStatus.relationIssueCount,0);
+ let cleanedJob;
+ for(let i=0;i<100;i++){
+  cleanedJob=(await call('jobs/detail',{jobId:pipeline.jobId})).job;
+  if(cleanedJob.cleanedAt)break;
+  await new Promise(resolve=>setTimeout(resolve,20));
+ }
+ assert.ok(cleanedJob.cleanedAt);
+ assert.equal(cleanedJob.inputId,undefined);
+ assert.deepEqual(cleanedJob.planIds,[]);
+ assert.equal(cleanedJob.counts.succeeded,2);
  assert.equal(rows.get('pipeline0').field_groups[0].fields_data[0].find(field=>field.field_data_name==='link')?.value,rows.get('pipeline1')._id);
  const missing=entity(['missing relation'],'repair');
  missing.records[0].data.g[0].link={instance_id:'not-exported',text:'repair key'};
