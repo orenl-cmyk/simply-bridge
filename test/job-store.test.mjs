@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdir,mkdtemp,readFile,writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {randomBytes,createCipheriv} from 'node:crypto';
-import {saveWriteIntent,finishWriteIntent,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState} from '../job-store.mjs';
+import {saveSegmentedPlan,loadPlanWork,loadPlanLinks,finishPlanLink,loadPlanMapping,saveWriteIntent,finishWriteIntent,saveDurableJob,saveDurablePlan,saveDurablePayload,appendDurableEvent,loadDurableState} from '../job-store.mjs';
 
 const work=path.resolve('/work');await mkdir(work,{recursive:true});
 function seal(value,key){
@@ -79,4 +79,25 @@ test('rerunning an interrupted migration skips committed journal rows',async()=>
  await writeFile(journal,lines.join('\n')+'\n');
  const state=await loadDurableState(directory,key);
  assert.deepEqual(state.events.get('job-1').map(event=>event.index),lines.map((_,index)=>index));
+});
+
+test('success and write-payload removal are atomic while a link remains pending',async()=>{
+ const directory=await mkdtemp(path.join(work,'row-work-test-')),key=randomBytes(32);
+ const mapping=[{sourceGroup:'source',targetGroup:'target'}];
+ const mappingId=await saveSegmentedPlan(directory,key,'plan',{segmented:true},
+  [[0,{planned:{value:'private'} }],[1,{planned:{value:'still open'}}]],
+  [[0,{id:'source',envelope:'{"relations":[]}'}]],mapping);
+ await saveWriteIntent(directory,key,'job','plan:0',{status:'pending'});
+ const ref={planId:'plan',index:0};
+ const outcome={status:'succeeded',targetId:'destination'};
+ await assert.rejects(finishWriteIntent(directory,key,'job','plan:0',outcome,{invalid:1n},ref),TypeError);
+ assert.equal((await loadPlanWork(directory,key,'plan',0)).planned.value,'private');
+ assert.equal((await loadDurableState(directory,key)).events.get('job').at(-1).value.status,'pending');
+ await finishWriteIntent(directory,key,'job','plan:0',outcome,{type:'progress',key:'plan:0',status:'succeeded'},ref);
+ assert.equal(await loadPlanWork(directory,key,'plan',0),null);
+ assert.equal((await loadPlanWork(directory,key,'plan',1)).planned.value,'still open');
+ assert.deepEqual(await loadPlanMapping(directory,key,mappingId),mapping);
+ assert.equal([...(await loadPlanLinks(directory,key,'plan'))()].length,1);
+ await finishPlanLink(directory,key,'job','plan',0,{type:'relation-progress',taskId:'plan:0',issues:[]});
+ assert.deepEqual([...(await loadPlanLinks(directory,key,'plan'))()],[]);
 });

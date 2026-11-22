@@ -106,6 +106,10 @@ async function openStore(directory,key){
    CREATE TABLE IF NOT EXISTS events(owner TEXT,sequence INTEGER,payload TEXT NOT NULL,PRIMARY KEY(owner,sequence));
    CREATE TABLE IF NOT EXISTS relation_identities(owner TEXT, fingerprint BLOB, payload TEXT NOT NULL, PRIMARY KEY(owner,fingerprint));
    CREATE TABLE IF NOT EXISTS import_keys(owner TEXT, fingerprint BLOB, PRIMARY KEY(owner,fingerprint));
+   CREATE TABLE IF NOT EXISTS plan_mapping_refs(plan TEXT PRIMARY KEY, mapping TEXT NOT NULL);
+   CREATE INDEX IF NOT EXISTS plan_mapping_lookup ON plan_mapping_refs(mapping);
+   CREATE TABLE IF NOT EXISTS plan_work(plan TEXT, position INTEGER, payload TEXT NOT NULL, PRIMARY KEY(plan,position));
+   CREATE TABLE IF NOT EXISTS plan_links(plan TEXT, position INTEGER, payload TEXT NOT NULL, PRIMARY KEY(plan,position));
    CREATE TABLE IF NOT EXISTS intents(owner TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(owner,id));
   `);
   if(!db.prepare("SELECT 1 FROM migration WHERE name='complete'").get())await migrate(db,directory,key);
@@ -135,9 +139,56 @@ export async function saveDurableJob(directory,key,id,job){
  delete stored.workerActive;
  delete stored.pipelineWorkerActive;
  delete stored.pendingRelationRepair;
+ if(stored.type==='import_run')delete stored.debug;
  await saveObject(directory,key,'jobs',id,stored);
 }
 export async function saveDurablePlan(directory,key,id,plan){await saveObject(directory,key,'plans',id,plan);}
+export async function saveSegmentedPlan(directory,key,id,header,work,links,mapping){
+ const db=await store(directory,key),plan=validId(id);
+ const putWork=db.prepare('INSERT INTO plan_work VALUES (?,?,?)');
+ const putLink=db.prepare('INSERT INTO plan_links VALUES (?,?,?)');
+ const mappingId=createHmac('sha256',key).update(JSON.stringify(mapping??[])).digest('hex');
+ transaction(db,()=>{
+  db.prepare("INSERT OR IGNORE INTO objects VALUES ('plan-mappings',?,?)")
+   .run(mappingId,JSON.stringify(envelope(mapping??[],key)));
+  db.prepare('INSERT INTO plan_mapping_refs VALUES (?,?)').run(plan,mappingId);
+  db.prepare("INSERT INTO objects VALUES ('plans',?,?) ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload")
+   .run(plan,JSON.stringify(envelope({...header,mappingId},key)));
+  for(const [position,value] of work)putWork.run(plan,position,JSON.stringify(envelope(value,key)));
+  for(const [position,value] of links)putLink.run(plan,position,JSON.stringify(envelope(value,key)));
+ });
+ return mappingId;
+}
+export async function loadPlanMapping(directory,key,id){
+ const db=await store(directory,key);
+ const result=db.prepare("SELECT payload FROM objects WHERE kind='plan-mappings' AND id=?").get(validId(id));
+ return result?open(JSON.parse(result.payload),key):null;
+}
+export async function loadPlanWork(directory,key,planId,position){
+ const db=await store(directory,key);
+ const row=db.prepare('SELECT payload FROM plan_work WHERE plan=? AND position=?').get(validId(planId),position);
+ return row?open(JSON.parse(row.payload),key):null;
+}
+export async function savePlanWork(directory,key,planId,position,value){
+ const db=await store(directory,key);
+ return db.prepare('UPDATE plan_work SET payload=? WHERE plan=? AND position=?')
+  .run(JSON.stringify(envelope(value,key)),validId(planId),position).changes===1;
+}
+export async function loadPlanLinks(directory,key,planId){
+ const db=await store(directory,key);
+ const rows=db.prepare('SELECT position,payload FROM plan_links WHERE plan=? ORDER BY position'),plan=validId(planId);
+ return function*(){
+  for(const row of rows.iterate(plan))yield [row.position,open(JSON.parse(row.payload),key)];
+ };
+}
+export async function finishPlanLink(directory,key,jobId,planId,position,event){
+ const db=await store(directory,key);
+ transaction(db,()=>{
+  insertEvent(db,key,validId(jobId),event);
+  if(!event.issues.length)db.prepare('DELETE FROM plan_links WHERE plan=? AND position=?').run(validId(planId),position);
+ });
+}
+
 export async function saveDurablePayload(directory,key,id,payload){await saveObject(directory,key,'payloads',id,payload);}
 export async function importIdentityIndex(directory,key,jobId){
  const db=await store(directory,key),owner=validId(jobId);
@@ -201,12 +252,13 @@ export async function saveWriteIntent(directory,key,jobId,rowId,value){
   .run(validId(jobId),validId(rowId),JSON.stringify(envelope(value,key)));
 }
 
-export async function finishWriteIntent(directory,key,jobId,rowId,value,progress){
+export async function finishWriteIntent(directory,key,jobId,rowId,value,progress,work){
  const db=await store(directory,key),owner=validId(jobId),id=validId(rowId);
  transaction(db,()=>{
   insertEvent(db,key,owner,{type:'outcome',id,value});
   if(progress)insertEvent(db,key,owner,progress);
   db.prepare('DELETE FROM intents WHERE owner=? AND id=?').run(owner,id);
+  if(value.status==='succeeded'&&work)db.prepare('DELETE FROM plan_work WHERE plan=? AND position=?').run(validId(work.planId),work.index);
  });
 }
 
@@ -247,6 +299,15 @@ async function remove(directory,kind,id){
  const db=await opening;
  transaction(db,()=>{
   db.prepare('DELETE FROM objects WHERE kind=? AND id=?').run(kind,validId(id));
+  if(kind==='plans'){
+   const mapping=db.prepare('SELECT mapping FROM plan_mapping_refs WHERE plan=?').get(id);
+   db.prepare('DELETE FROM plan_mapping_refs WHERE plan=?').run(id);
+   if(mapping&&!db.prepare('SELECT 1 FROM plan_mapping_refs WHERE mapping=? LIMIT 1').get(mapping.mapping)){
+    db.prepare("DELETE FROM objects WHERE kind='plan-mappings' AND id=?").run(mapping.mapping);
+   }
+   db.prepare('DELETE FROM plan_work WHERE plan=?').run(id);
+   db.prepare('DELETE FROM plan_links WHERE plan=?').run(id);
+  }
   if(kind==='jobs'){
    db.prepare('DELETE FROM events WHERE owner=?').run(id);
    db.prepare('DELETE FROM intents WHERE owner=?').run(id);
