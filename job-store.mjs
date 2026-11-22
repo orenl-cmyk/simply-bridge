@@ -137,6 +137,17 @@ export async function saveDurableJob(directory,key,id,job){
 }
 export async function saveDurablePlan(directory,key,id,plan){await saveObject(directory,key,'plans',id,plan);}
 export async function saveDurablePayload(directory,key,id,payload){await saveObject(directory,key,'payloads',id,payload);}
+export async function saveImportBatch(directory,key,inputId,index,batch){
+ await saveObject(directory,key,'import-batches',inputId+':'+index,batch);
+}
+export async function loadImportBatch(directory,key,inputId,index){
+ const db=await store(directory,key);
+ const row=db.prepare("SELECT payload FROM objects WHERE kind='import-batches' AND id=?").get(validId(inputId+':'+index));
+ return row?open(JSON.parse(row.payload),key):null;
+}
+export async function deleteImportBatch(directory,inputId,index){
+ await remove(directory,'import-batches',inputId+':'+index);
+}
 export async function appendDurableEvent(directory,key,jobId,event){
  const db=await store(directory,key);
  insertEvent(db,key,validId(jobId),event);
@@ -207,4 +218,14 @@ async function remove(directory,kind,id){
 }
 export async function deleteDurableJob(directory,id){await remove(directory,'jobs',id);}
 export async function deleteDurablePlan(directory,id){await remove(directory,'plans',id);}
-export async function deleteDurablePayload(directory,id){await remove(directory,'payloads',id);}
+export async function deleteDurablePayload(directory,id){
+ const opening=stores.get(path.resolve(directory));
+ if(!opening)return;
+ const db=await opening;
+ const prefix=validId(id)+':';
+ transaction(db,()=>{
+  db.prepare("DELETE FROM objects WHERE kind='payloads' AND id=?").run(id);
+  db.prepare("DELETE FROM objects WHERE kind='import-batches' AND id>=? AND id<?")
+   .run(prefix,prefix.slice(0,-1)+';');
+ });
+}
