@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import {createRelationFinalizer} from '../relation-finalizer.mjs';
 import {resolveBlackIssue,validateBlackConfig} from '../black-issue-resolver.mjs';
+import {batchLookup} from '../relations.mjs';
 import {writeRelations} from '../relation-write.mjs';
 
 const instance=(_id,values)=>({_id,field_groups:[{fields_data:[Object.entries(values).map(([field_data_name,value])=>({field_data_name,value}))]}]});
@@ -32,6 +34,37 @@ test('Finalizer overwrites a partial multi-relation, caches lookups, and preserv
  assert.deepEqual(writes[2],[]);
  await finalize(request([]));
  assert.deepEqual(writes[3][0].value,[]);
+});
+
+test('relation target searches include archived records',async()=>{
+ let request;
+ await batchLookup({connection:{},targetId:'linked',key:{kind:'field',groupId:'g',fieldId:'external'},values:['key'],read:async(_connection,_operation,params)=>{
+  request=params;
+  return {data:[],info:{total_count:0}};
+ }});
+ assert.equal(request.with_archive,1);
+});
+
+test('HTTP 200 Origami API errors preserve the existing relation field',async t=>{
+ const server=http.createServer((_request,response)=>{
+  response.writeHead(200,{'content-type':'application/json'});
+  response.end(JSON.stringify({error:{type:'query',message:'Filter rejected'}}));
+ });
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>server.close(resolve)));
+ let writes=0;
+ const finalize=createRelationFinalizer({
+  connection:{baseUrl:`http://127.0.0.1:${server.address().port}`,username:'test',secret:'test'},
+  rules:[{sourceEntity:'source',groupId:'g',fieldId:'link',sourceRelatedEntity:'linked',targetEntity:'linked-target',targetKey:{kind:'field',groupId:'g',fieldId:'external'},valueMode:'sourceText'}],
+  identities:new Map(),
+  schemas:new Map([['linked-target',{groups:[{id:'g',fields:[{id:'external',type:'input-text'}]}]}]]),
+  write:async({fields})=>{writes++;assert.deepEqual(fields,[]);}
+ });
+ const issues=await finalize({entity:'target',id:'record',schema:{groups:[{id:'g',fields:[{id:'link',type:'select-from-entity'}]}]},envelope:{relations:[{
+  source:{entity:'source',value:{instance_id:'missing',text:'lookup'}},target:{groupId:'g',fieldId:'link'}
+ }]}});
+ assert.ok(issues.some(issue=>issue.kind==='needs_attention'));
+ assert.equal(writes,1);
 });
 
 test('BLACK resolver scopes hierarchy and inventory, excludes archive and selects duplicates deterministically',async()=>{

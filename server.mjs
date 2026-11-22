@@ -1216,7 +1216,7 @@ async function api(req,res,url){
  if(url==='/api/repairs/action'&&method==='POST'){
   const b=await bodyOf(req),ids=Array.isArray(b.issueIds)?b.issueIds:[b.issueId];if(!ids.length||ids.length>500)throw fail(422,'יש לבחור בין תקלה אחת ל־500 תקלות.');const results=[];
   for(const issueId of ids){const issue=findRepairIssue(s,issueId),{jobId,key,job,row}=issue;if(b.action==='report'){if(job.ownerId!==s.userId)throw fail(403,'ניתן לדווח רק על תקלה בריצה שלך.');const meta={reportedAt:new Date().toISOString(),repairStatus:'reported',reportNote:String(b.note||'').slice(0,1000)};Object.assign(row,meta);await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,row,meta});await storeJob(jobId,job,s.key);results.push({issueId,status:'reported'});continue;}
-   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');if(b.action==='close'||b.action==='reopen'){const meta={repairStatus:b.action==='close'?'closed':'reported',closedAt:b.action==='close'?new Date().toISOString():null,adminNote:String(b.note||'').slice(0,1000)};Object.assign(row,meta);await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,row,meta});await storeJob(jobId,job,s.key);results.push({issueId,status:meta.repairStatus});continue;}
+   if(s.role!=='admin')throw fail(403,'הפעולה זמינה למנהל בלבד.');if(b.action==='close'||b.action==='reopen'){const note=String(b.note||'').trim();if(b.action==='close'&&note.length<10)throw fail(422,'יש לתעד את החלטת הסגירה בעשרה תווים לפחות.');const meta={repairStatus:b.action==='close'?'closed':'reported',closedAt:b.action==='close'?new Date().toISOString():null,adminNote:note.slice(0,1000)};Object.assign(row,meta);await appendDurableEvent(directory,s.key,jobId,{type:'repair',key,row,meta});await storeJob(jobId,job,s.key);results.push({issueId,status:meta.repairStatus});continue;}
    if(b.action==='retry'){
     const existing=job.pendingRowRepairs?.get(key);
     if(existing){results.push({issueId,...await processRowRepair(jobId,job,existing,s)});continue;}
@@ -1233,15 +1233,39 @@ async function api(req,res,url){
      }
      for(const {operation,body} of b.writePayloads){
       const original=(planned.requests||[]).find(step=>step.operation===operation)?.body;
-      if(body.entity_data_name!==plan.targetId||
+      if(!original||body.entity_data_name!==plan.targetId||
          (operation==='update_instance_fields'&&JSON.stringify(body.filter)!==JSON.stringify(original.filter))||
-         (operation==='add_group_repetition'&&body._id!==original._id)){
+         (operation==='add_group_repetition'&&(body._id!==original._id||body.group_data_name!==original.group_data_name))){
        throw fail(422,'בקשת התיקון חייבת לפנות לרשומת היעד המקורית.');
       }
+      const sameKeys=(left,right)=>left&&right&&typeof left==='object'&&typeof right==='object'&&
+       !Array.isArray(left)&&!Array.isArray(right)&&
+       JSON.stringify(Object.keys(left).sort())===JSON.stringify(Object.keys(right).sort());
+      if(operation==='update_instance_fields'){
+       const originalFields=original.field||[],correctedFields=body.field||[];
+       if(!Array.isArray(correctedFields)||!correctedFields.length){
+        throw fail(422,'תיקון עדכון רשאי לשנות ערכי שדות שכבר נכללו בתוכנית בלבד.');
+       }
+       const slots=fields=>fields.map(item=>Array.isArray(item)&&item.length===3?JSON.stringify([item[0],Number(item[2])]):'invalid');
+       if(
+          new Set(slots(correctedFields)).size!==correctedFields.length||
+          JSON.stringify(slots(correctedFields).sort())!==JSON.stringify(slots(originalFields).sort())){
+        throw fail(422,'תיקון עדכון רשאי לשנות ערכי שדות שכבר נכללו בתוכנית בלבד.');
+       }
+      }
+      if(operation==='add_group_repetition'&&!sameKeys(body.group_data,original.group_data)){
+       throw fail(422,'תיקון שורה חוזרת רשאי לשנות ערכי שדות שכבר נכללו בתוכנית בלבד.');
+      }
       if(operation==='create_instance'){
-       const group=body.form_data?.find?.(item=>item.group_data_name===plan.targetKey.groupId);
-       if(String(group?.data?.[0]?.[plan.targetKey.fieldId])!==String(row.matchKey)){
-        throw fail(422,'תיקון יצירה חייב לשמור על אותו מפתח הצלבה.');
+       const expected=original.form_data||[],actual=body.form_data||[];
+       const sameForm=Array.isArray(actual)&&actual.length===expected.length&&expected.every((group,index)=>{
+        const next=actual[index];
+        return next?.group_data_name===group.group_data_name&&Array.isArray(next.data)&&
+         next.data.length===group.data?.length&&next.data.every((entry,rowIndex)=>sameKeys(entry,group.data[rowIndex]));
+       });
+       const group=actual.find?.(item=>item.group_data_name===plan.targetKey.groupId);
+       if(!sameForm||String(group?.data?.[0]?.[plan.targetKey.fieldId])!==String(row.matchKey)){
+        throw fail(422,'תיקון יצירה רשאי לשנות ערכים ממופים בלבד ולשמור על מפתח ההצלבה המקורי.');
        }
       }
      }
@@ -1473,7 +1497,7 @@ async function api(req,res,url){
  }else throw fail(404,'הפעולה לא נמצאה.');
  await commit(s,next);send(res,200,publicData(s));
 }
-const assets={'/import-file.js':['import-file.js','text/javascript; charset=utf-8'],'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
+const assets={'/import-file.js':['import-file.js','text/javascript; charset=utf-8'],'/export-package.js':['export-package.js','text/javascript; charset=utf-8'],'/boot.js':['boot.js','text/javascript; charset=utf-8'],'/operations-ui.js':['operations-ui.js','text/javascript; charset=utf-8'],'/import-batches.js':['import-batches.js','text/javascript; charset=utf-8'],'/preset-transfer.js':['preset-transfer.js','text/javascript; charset=utf-8'],'/relations.js':['relations.js','text/javascript; charset=utf-8'],'/import-errors.js':['import-errors.js','text/javascript; charset=utf-8'],'/import-mapping.js':['import-mapping.js','text/javascript; charset=utf-8'],'/dry-run.js':['dry-run.js','text/javascript; charset=utf-8'],'/transfer.schema.json':['transfer.schema.json','application/schema+json'],'/export.js':['export.js','text/javascript; charset=utf-8'],'/presets.js':['presets.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/schema.js':['schema.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
 const server=http.createServer((req,res)=>{
  res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'");
  const run=async()=>{try{

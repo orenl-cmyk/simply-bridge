@@ -9,7 +9,7 @@ export function checkKey(schema,key){if(key?.kind==='recordId')return;const g=sc
 export async function batchLookup({connection,targetId,key,values,read=readOrigami,guard=()=>{},onDebug=()=>{}}){
  const unique=[...new Map(values.map(v=>{if(!scalar(v))bad('מפתח קישור אינו ערך פשוט.');return [String(v),v];})).values()],found=new Map(unique.map(v=>[String(v),[]])),details=new Map(),field=key.kind==='recordId'?'_id':key.fieldId;Object.defineProperty(found,'details',{value:details});
  const collect=async(filter,wanted)=>{const rows=[],seen=new Set();let total=null,skip=0,ignored=false;
-  do{guard();const raw=await read(connection,'instance_data',{entity_data_name:targetId,filter,limit:[skip,500]},onDebug,guard);guard();const n=Number(raw.info?.total_count);if(!Array.isArray(raw.data)||!Number.isSafeInteger(n)||n<0||(total!==null&&n!==total))bad('תשובת חיפוש קישורים חלקית או משתנה.');total=n;
+  do{guard();const raw=await read(connection,'instance_data',{entity_data_name:targetId,filter,limit:[skip,500],with_archive:1},onDebug,guard);guard();const n=Number(raw.info?.total_count);if(!Array.isArray(raw.data)||!Number.isSafeInteger(n)||n<0||(total!==null&&n!==total))bad('תשובת חיפוש קישורים חלקית או משתנה.');total=n;
    for(const item of raw.data){const r=item.instance_data,k=r&&keyValue(r,key);if(!r||typeof r._id!=='string'||!r._id||!scalar(k)||seen.has(r._id))bad('תשובת קישורים אינה תקינה או כוללת אותה רשומה יותר מפעם אחת.');seen.add(r._id);if(!wanted.has(String(k))){ignored=true;continue;}rows.push({r,k});}
    skip+=raw.data.length;if(skip>total||(!raw.data.length&&skip<total))bad('תשובת קישורים אינה מלאה.');
   }while(skip<total);return {rows,ignored};};

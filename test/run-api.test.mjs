@@ -142,6 +142,12 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const failedRows=(await call('repairs/list',{})).rows;
  const failed=failedRows.find(row=>row.jobId===mixedRun.jobId&&row.matchKey==='mixed-row499');
  assert.ok(failed);
+ const forged=structuredClone(failed.writePayloads);
+ forged[0].body.form_data[0].data[0].unmapped_admin_field='should be rejected';
+ const beforeRejectedRepair=writes.length;
+ const rejected=await call('repairs/action',{action:'retry',issueId:failed.issueId,writePayloads:forged});
+ assert.equal(rejected.status,422);
+ assert.equal(writes.length,beforeRejectedRepair);
  const repaired=structuredClone(failed.writePayloads);
  repaired[0].body.form_data[0].data[0].title='repair saved before reply';
  const repairReachedTarget=new Promise(resolve=>{storedBeforeReply=resolve;});
@@ -186,6 +192,10 @@ test('RUN creates, skips validation failure and continues; replay is idempotent;
  const guarded=await call('repairs/action',{action:'retry',issueId:conflict.issueId});
  assert.equal(guarded.results[0].status,'not_sent');
  assert.equal(writes.length,beforeRepair);
+ const undocumentedClose=await call('repairs/action',{action:'close',issueId:conflict.issueId,note:'short'});
+ assert.equal(undocumentedClose.status,422);
+ const documentedClose=await call('repairs/action',{action:'close',issueId:conflict.issueId,note:'נבדק יעד קיים; נדרש טיפול ידני.'});
+ assert.equal(documentedClose.results[0].status,'closed');
  if(loadRows){
   const parts=[JSON.stringify({connectionId:c,schemaVersion:'1.0'})+'\n'];
   for(let offset=0;offset<loadRows;offset+=500){

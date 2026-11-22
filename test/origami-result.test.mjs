@@ -15,6 +15,7 @@ test('HTTP 200 max_api_calls is a rate limit and pauses a row without recording 
 test('validation and authorization bodies remain distinct from hourly quota errors',()=>{
  assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'validation',message:'required'}}}).kind,'validation');
  assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'permission',message:'denied'}}}).kind,'authorization');
+ assert.equal(classifyOrigamiResult({status:200,responseOk:true,data:{error:{type:'query',message:'Invalid filter'}}}).kind,'api_error');
 });
 
 test('explicit uniqueness errors differ from an uncertain server response',()=>{
