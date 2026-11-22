@@ -10,6 +10,19 @@ async function atomic(file,value,key){await mkdir(path.dirname(file),{recursive:
 async function readEncrypted(file,key){return open(JSON.parse(await readFile(file,'utf8')),key);}
 async function files(folder,suffix){try{return (await readdir(folder)).filter(name=>name.endsWith(suffix));}catch(error){if(error.code==='ENOENT')return [];throw error;}}
 
+export async function saveRecoveryKey(directory,serviceKey,vaultKey){
+ await atomic(path.join(rootOf(directory),'recovery.json'),{key:vaultKey.toString('base64')},serviceKey);
+}
+
+export async function loadRecoveryKey(directory,serviceKey){
+ try{
+  const value=await readEncrypted(path.join(rootOf(directory),'recovery.json'),serviceKey);
+  const key=Buffer.from(value.key,'base64');
+  if(key.length!==32)throw Error('Invalid recovery key');
+  return key;
+ }catch(error){if(error.code==='ENOENT')return null;throw error;}
+}
+
 export async function saveDurableJob(directory,key,id,job){id=validId(id);const stored=structuredClone(job);delete stored.key;delete stored.members;delete stored.workerActive;delete stored.pipelineWorkerActive;await atomic(path.join(rootOf(directory),'jobs',id+'.json'),stored,key);}
 export async function saveDurablePlan(directory,key,id,plan){id=validId(id);await atomic(path.join(rootOf(directory),'plans',id+'.json'),plan,key);}
 export async function saveDurablePayload(directory,key,id,payload){id=validId(id);await atomic(path.join(rootOf(directory),'payloads',id+'.json'),payload,key);}

@@ -89,3 +89,19 @@ podman compose logs --tail 100 bridge
 ```
 
 אין לבצע `down -v`. טעינת ה־image אינה משנה את `.env`, את קובצי ה־Compose, את תעודת הארגון או את ה־volume. ה־TAR כולל גם תג ממוספר לצורך חזרה לגרסה קודמת.
+
+## Automatic recovery of background imports
+
+To enable recovery before a user signs in, provision a secret file containing
+32 raw random bytes. Mount it read-only outside the application data volume
+and set `BRIDGE_RECOVERY_KEY_FILE` to its path inside the container. The file
+must be readable by the container's application user. Keep the key separate
+from data-volume backups. Together, the key and backup can decrypt the vault
+and the job data.
+
+The application saves an encrypted recovery record when an authenticated
+user starts or resumes a background import. After restart, it resumes eligible
+running imports against their original connection. Jobs paused for intervention
+and jobs explicitly stopped remain available for authenticated handling.
+If an interrupted write cannot be confirmed from destination values, the
+application records it for review and proceeds with independent records.
