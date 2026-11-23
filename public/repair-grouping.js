@@ -21,6 +21,7 @@ export function summarizeRepairGroups(issues=[]){
    connectionName:issue.connectionName||'',jobLabel:issue.jobLabel||'',affectedRecords:0,retryableRecords:0,replanableRecords:0,closeableRecords:0};groups.set(groupId,group);}
   group.affectedRecords++;
   if(['failed','not_sent'].includes(issue.status)&&issue.repairStatus!=='closed'&&!issue.semanticPreview){group.retryableRecords++;group.replanableRecords++;}
+  else if(issue.status==='blocked'&&issue.repairStatus!=='closed'&&!issue.semanticPreview)group.replanableRecords++;
   if(issue.repairStatus!=='closed')group.closeableRecords++;
  }
  return [...groups.values()].sort((a,b)=>b.affectedRecords-a.affectedRecords||a.title.localeCompare(b.title,'he'));

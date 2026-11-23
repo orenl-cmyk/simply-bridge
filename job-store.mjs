@@ -106,6 +106,7 @@ async function openStore(directory,key){
    CREATE TABLE IF NOT EXISTS events(owner TEXT,sequence INTEGER,payload TEXT NOT NULL,PRIMARY KEY(owner,sequence));
    CREATE TABLE IF NOT EXISTS relation_identities(owner TEXT, fingerprint BLOB, payload TEXT NOT NULL, PRIMARY KEY(owner,fingerprint));
    CREATE TABLE IF NOT EXISTS import_keys(owner TEXT, fingerprint BLOB, PRIMARY KEY(owner,fingerprint));
+   CREATE TABLE IF NOT EXISTS import_duplicates(owner TEXT,batch INTEGER,position INTEGER,PRIMARY KEY(owner,batch,position));
    CREATE TABLE IF NOT EXISTS plan_mapping_refs(plan TEXT PRIMARY KEY, mapping TEXT NOT NULL);
    CREATE INDEX IF NOT EXISTS plan_mapping_lookup ON plan_mapping_refs(mapping);
    CREATE TABLE IF NOT EXISTS plan_work(plan TEXT, position INTEGER, payload TEXT NOT NULL, PRIMARY KEY(plan,position));
@@ -190,8 +191,22 @@ export async function finishPlanLink(directory,key,jobId,planId,position,event){
   if(!event.issues.length)db.prepare('DELETE FROM plan_links WHERE plan=? AND position=?').run(validId(planId),position);
  });
 }
+export async function blockPlanRows(directory,key,planId,plan,positions){
+ const db=await store(directory,key),id=validId(planId),removeLink=db.prepare('DELETE FROM plan_links WHERE plan=? AND position=?');
+ return transaction(db,()=>{
+  let removedLinks=0;for(const position of positions)removedLinks+=removeLink.run(id,position).changes;
+  plan.linkCount=Math.max(0,(plan.linkCount||0)-removedLinks);
+  const saved=db.prepare("UPDATE objects SET payload=? WHERE kind='plans' AND id=?").run(JSON.stringify(envelope(plan,key)),id);
+  if(!saved.changes)throw Error('Durable plan is missing while blocking preflight rows');
+  return removedLinks;
+ });
+}
 
 export async function saveDurablePayload(directory,key,id,payload){await saveObject(directory,key,'payloads',id,payload);}
+export async function loadDurablePayload(directory,key,id){
+ const db=await store(directory,key),row=db.prepare("SELECT payload FROM objects WHERE kind='payloads' AND id=?").get(validId(id));
+ return row?open(JSON.parse(row.payload),key):null;
+}
 export async function importIdentityIndex(directory,key,jobId){
  const db=await store(directory,key),owner=validId(jobId);
  const query=db.prepare('SELECT payload FROM relation_identities WHERE owner=? AND fingerprint=?');
@@ -214,21 +229,26 @@ export async function clearImportIdentities(directory,key,jobId){
 
 export async function saveImportBatch(directory,key,inputId,index,batch){
  const db=await store(directory,key),owner=validId(inputId);
+ const existing=db.prepare('SELECT 1 FROM import_keys WHERE owner=? AND fingerprint=?');
  const reserve=db.prepare('INSERT OR IGNORE INTO import_keys VALUES (?,?)');
+ const duplicate=db.prepare('INSERT OR IGNORE INTO import_duplicates VALUES (?,?,?)');
  transaction(db,()=>{
-  for(const record of batch.entity.records){
+  for(const [position,record] of batch.entity.records.entries()){
    const fields=[batch.targetId,batch.targetKey,String(record?.matchKey)];
    const fingerprint=createHmac('sha256',key).update(JSON.stringify(fields)).digest();
-   if(!reserve.run(owner,fingerprint).changes){
-    throw Object.assign(Error('יותר מרשומת מקור אחת מופנית לאותו מפתח יעד: '+fields[2]),{status:422});
-   }
+   if(existing.get(owner,fingerprint))duplicate.run(owner,index,position);
+   else reserve.run(owner,fingerprint);
   }
   db.prepare('INSERT INTO objects VALUES (?,?,?)').run('import-batches',validId(owner+':'+index),JSON.stringify(envelope(batch,key)));
  });
 }
+export async function loadImportDuplicatePositions(directory,inputId,index){
+ const opening=stores.get(path.resolve(directory));if(!opening)return [];
+ const db=await opening;return db.prepare('SELECT position FROM import_duplicates WHERE owner=? AND batch=? ORDER BY position').all(validId(inputId),index).map(row=>Number(row.position));
+}
 export async function clearImportKeys(directory,key,inputId){
  const db=await store(directory,key);
- db.prepare('DELETE FROM import_keys WHERE owner=?').run(validId(inputId));
+ transaction(db,()=>{db.prepare('DELETE FROM import_keys WHERE owner=?').run(validId(inputId));db.prepare('DELETE FROM import_duplicates WHERE owner=?').run(validId(inputId));});
 }
 export async function loadImportBatch(directory,key,inputId,index){
  const db=await store(directory,key);
