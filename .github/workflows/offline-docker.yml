@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name == 'push' || github.ref_name != 'feature/relation-finalizer-024'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref_name != 'feature/relation-finalizer-024' && github.ref_name != 'release/0.24.0-build')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -44,7 +44,9 @@ jobs:
           retention-days: 3
 
   build-024-image:
-    if: github.event_name == 'workflow_dispatch' && github.ref_name == 'feature/relation-finalizer-024'
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == 'release/0.24.0-build'
     uses: ./.github/workflows/docker-image-024.yml
+    with:
+      source_sha: 4ce801b1e58e5e5928afb84af7c8b3249b2797e5
     permissions:
       contents: read

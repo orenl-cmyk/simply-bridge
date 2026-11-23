@@ -2,6 +2,11 @@ name: Build Simply Bridge 0.24.0 image TAR
 
 on:
   workflow_call:
+    inputs:
+      source_sha:
+        description: Exact application commit to package
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,11 +18,13 @@ jobs:
     env:
       APP_VERSION: 0.24.0
       NODE_VERSION: 22.23.5
+      SOURCE_SHA: ${{ inputs.source_sha }}
       IMAGE: simply-bridge:0.24.0
       CURRENT_IMAGE: simply-bridge:current
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v4
@@ -28,8 +35,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$GITHUB_REF" = "refs/heads/feature/relation-finalizer-024"
+          test "$SOURCE_SHA" = "4ce801b1e58e5e5928afb84af7c8b3249b2797e5"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$GITHUB_REF" = "refs/heads/release/0.24.0-build"
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(node -p "require('./package.json').version")" = "$APP_VERSION"
           node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES (\"sqlite-ready\")'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
@@ -70,37 +78,7 @@ jobs:
             --entrypoint node "$IMAGE" \
             --test --test-concurrency=1 '/app/test/*.test.mjs'
 
-      - name: Smoke test container health
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="simply-bridge-smoke-${GITHUB_RUN_ID}"
-          volume="simply-bridge-smoke-data-${GITHUB_RUN_ID}"
-          cleanup() {
-            docker rm --force "$name" >/dev/null 2>&1 || true
-            docker volume rm "$volume" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker volume create "$volume" >/dev/null
-          docker run --detach --name "$name" \
-            --env PUBLIC_URL=http://127.0.0.1:4318/ \
-            --volume "$volume:/app/data" "$IMAGE" >/dev/null
-          for attempt in $(seq 1 45); do
-            health="$(docker inspect --format '{{.State.Health.Status}}' "$name")"
-            if [ "$health" = healthy ]; then
-              docker exec "$name" node /app/deploy/healthcheck.mjs
-              exit 0
-            fi
-            if [ "$health" = unhealthy ]; then
-              docker logs "$name" >&2
-              exit 1
-            fi
-            sleep 1
-          done
-          docker logs "$name" >&2
-          exit 1
-
-      - name: Create one image TAR and SHA256
+      - name: Save, reload and verify one image archive
         id: package
         shell: bash
         run: |
@@ -117,24 +95,64 @@ jobs:
           assert len(manifest) == 1, f'Expected one image, found {len(manifest)}'
           assert set(manifest[0]['RepoTags']) == {'simply-bridge:0.24.0', 'simply-bridge:current'}
           PY
-          (cd artifact && sha256sum "$tar" > "$tar.sha256" && sha256sum --check "$tar.sha256")
-          sha="$(cut -d ' ' -f 1 "artifact/$tar.sha256")"
+          before="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+          docker image rm "$IMAGE" "$CURRENT_IMAGE" >/dev/null
+          docker load --input "artifact/$tar"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$before"
+          test "$(docker image inspect --format '{{.Id}}' "$CURRENT_IMAGE")" = "$before"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
+
+          name="simply-bridge-smoke-${GITHUB_RUN_ID}"
+          volume="simply-bridge-smoke-data-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm --force "$name" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          docker run --detach --network none --name "$name" \
+            --env PUBLIC_URL=http://127.0.0.1:4318/ \
+            --volume "$volume:/app/data" "$IMAGE" >/dev/null
+          for attempt in $(seq 1 45); do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$name")"
+            if [ "$health" = healthy ]; then
+              docker exec "$name" node /app/deploy/healthcheck.mjs
+              break
+            fi
+            if [ "$health" = unhealthy ]; then
+              docker logs "$name" >&2
+              exit 1
+            fi
+            if [ "$attempt" = 45 ]; then
+              docker logs "$name" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          cleanup
+          trap - EXIT
+
+          gz="simply-bridge-${APP_VERSION}-image.tar.gz"
+          gzip -n -9 -c "artifact/$tar" > "artifact/$gz"
+          (cd artifact && sha256sum "$gz" > "$gz.sha256" && sha256sum --check "$gz.sha256")
+          sha="$(cut -d ' ' -f 1 "artifact/$gz.sha256")"
           printf 'sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
           {
             echo '## Simply Bridge 0.24.0 Docker image'
-            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Source commit: \`$SOURCE_SHA\`"
+            echo "- Workflow commit: \`$GITHUB_SHA\`"
             echo '- Platform: \`linux/amd64\`'
             echo "- Node: \`v${NODE_VERSION}\`"
-            echo "- TAR: \`$tar\`"
+            echo "- Archive: \`$gz\`"
             echo "- SHA256: \`$sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: simply-bridge-0.24.0-linux-amd64
+          name: simply-bridge-0.24.0-image
           path: |
-            artifact/simply-bridge-0.24.0-linux-amd64.tar
-            artifact/simply-bridge-0.24.0-linux-amd64.tar.sha256
+            artifact/simply-bridge-0.24.0-image.tar.gz
+            artifact/simply-bridge-0.24.0-image.tar.gz.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
