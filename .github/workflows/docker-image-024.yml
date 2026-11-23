@@ -1,4 +1,4 @@
-name: Build Simply Bridge 0.24.0 image TAR
+name: Build Simply Bridge 0.24.1 image TAR and ZIP
 
 on:
   workflow_call:
@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      APP_VERSION: 0.24.0
+      APP_VERSION: 0.24.1
       NODE_VERSION: 22.23.5
-      IMAGE: simply-bridge:0.24.0
+      IMAGE: simply-bridge:0.24.1
       CURRENT_IMAGE: simply-bridge:current
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +32,14 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/feature/relation-finalizer-024"
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(node -p "require('./package.json').version")" = "$APP_VERSION"
-          node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT)'); db.prepare('INSERT INTO probe VALUES (?)').run('sqlite-ready'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
+          node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES (\"sqlite-ready\")'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
           grep -F "ARG NODE_IMAGE=node:${NODE_VERSION}-bookworm-slim" Dockerfile
           grep -F '"node": ">=22.13.0"' package.json
-          grep -F 'simply-bridge:0.24.0' deploy/compose.yaml docker-compose.yml
+          grep -F "simply-bridge:${APP_VERSION}" deploy/compose.yaml
 
       - name: Run source regression suite
+        env:
+          NODE_USE_ENV_PROXY: "0"
         run: npm test
 
       - uses: docker/setup-buildx-action@v3
@@ -57,7 +59,7 @@ jobs:
           test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
           test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "$APP_VERSION"
           docker run --rm --entrypoint node "$IMAGE" -e "const assert=require('node:assert/strict'); assert.equal(process.version,'v${NODE_VERSION}'); assert.equal(require('/app/package.json').version,'${APP_VERSION}');"
-          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT)'); db.prepare('INSERT INTO probe VALUES (?)').run('sqlite-ready'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
+          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES (\"sqlite-ready\")'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
           docker image inspect --format '{{json .Config.Volumes}}' "$IMAGE" | grep -F '"/app/data"'
 
       - name: Run regression suite with packaged Node runtime
@@ -67,6 +69,7 @@ jobs:
           docker run --rm --network none \
             --tmpfs /work:uid=1000,gid=1000 \
             --volume "$GITHUB_WORKSPACE/test:/app/test:ro" \
+            --env NODE_USE_ENV_PROXY=0 \
             --entrypoint node "$IMAGE" \
             --test --test-concurrency=1 '/app/test/*.test.mjs'
 
@@ -110,20 +113,23 @@ jobs:
           test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$(docker image inspect --format '{{.Id}}' "$CURRENT_IMAGE")"
           tar="simply-bridge-${APP_VERSION}-linux-amd64.tar"
           docker image save --output "artifact/$tar" "$IMAGE" "$CURRENT_IMAGE"
-          python3 - "artifact/$tar" <<'PY'
+          python3 - "artifact/$tar" "$APP_VERSION" <<'PY'
           import json, sys, tarfile
           with tarfile.open(sys.argv[1]) as archive:
               manifest = json.load(archive.extractfile('manifest.json'))
           assert len(manifest) == 1, f'Expected one image, found {len(manifest)}'
-          assert set(manifest[0]['RepoTags']) == {'simply-bridge:0.24.0', 'simply-bridge:current'}
+          assert set(manifest[0]['RepoTags']) == {f'simply-bridge:{sys.argv[2]}', 'simply-bridge:current'}
           PY
           (cd artifact && sha256sum "$tar" > "$tar.sha256" && sha256sum --check "$tar.sha256")
           cp deploy/compose.yaml artifact/compose.yaml
           cp deploy/INSTALL-PODMAN-CMD.txt artifact/INSTALL-PODMAN-CMD.txt
+          zip="simply-bridge-${APP_VERSION}-linux-amd64.zip"
+          (cd artifact && zip -0 -j "$zip" "$tar" "$tar.sha256" compose.yaml INSTALL-PODMAN-CMD.txt)
+          (cd artifact && sha256sum "$zip" > "$zip.sha256" && sha256sum --check "$zip.sha256")
           sha="$(cut -d ' ' -f 1 "artifact/$tar.sha256")"
           printf 'sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
           {
-            echo '## Simply Bridge 0.24.0 Docker image'
+            echo "## Simply Bridge ${APP_VERSION} Docker image"
             echo "- Commit: \`$GITHUB_SHA\`"
             echo '- Platform: \`linux/amd64\`'
             echo "- Node: \`v${NODE_VERSION}\`"
@@ -133,10 +139,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: simply-bridge-0.24.0-linux-amd64
+          name: simply-bridge-0.24.1-linux-amd64
           path: |
-            artifact/simply-bridge-0.24.0-linux-amd64.tar
-            artifact/simply-bridge-0.24.0-linux-amd64.tar.sha256
+            artifact/simply-bridge-0.24.1-linux-amd64.tar
+            artifact/simply-bridge-0.24.1-linux-amd64.tar.sha256
+            artifact/simply-bridge-0.24.1-linux-amd64.zip
+            artifact/simply-bridge-0.24.1-linux-amd64.zip.sha256
             artifact/compose.yaml
             artifact/INSTALL-PODMAN-CMD.txt
           if-no-files-found: error

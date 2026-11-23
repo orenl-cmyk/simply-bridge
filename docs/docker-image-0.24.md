@@ -1,10 +1,12 @@
-# Docker image handoff for Simply Bridge 0.24.0
+# Docker image handoff for Simply Bridge 0.24.1
 
-The `feature/relation-finalizer-024` branch has a manually dispatched GitHub
-Actions build. After verifying that branch on GitHub, start it with:
+Pushes to `feature/relation-finalizer-024` run the GitHub Actions image build.
+The workflow tests the exact commit, builds `linux/amd64`, validates health,
+and uploads a TAR, its checksum, and a ZIP containing the TAR plus Podman CMD
+installation instructions.
 
 ```sh
-gh workflow run offline-docker.yml --ref feature/relation-finalizer-024
+gh run list --workflow offline-docker.yml --branch feature/relation-finalizer-024
 ```
 
 The workflow checks out the exact commit, runs the regression suite, builds the
@@ -16,13 +18,13 @@ work.
 To build and test locally on a host with Docker Engine:
 
 ```sh
-docker build --platform linux/amd64 -t simply-bridge:0.24.0 .
-docker tag simply-bridge:0.24.0 simply-bridge:current
-docker run --rm --entrypoint node simply-bridge:0.24.0 --version
-docker save -o simply-bridge-0.24.0-linux-amd64.tar simply-bridge:0.24.0 simply-bridge:current
-sha256sum simply-bridge-0.24.0-linux-amd64.tar
-docker load -i simply-bridge-0.24.0-linux-amd64.tar
-docker run -d --rm --name simply-bridge-smoke simply-bridge:0.24.0
+docker build --platform linux/amd64 -t simply-bridge:0.24.1 .
+docker tag simply-bridge:0.24.1 simply-bridge:current
+docker run --rm --entrypoint node simply-bridge:0.24.1 --version
+docker save -o simply-bridge-0.24.1-linux-amd64.tar simply-bridge:0.24.1 simply-bridge:current
+sha256sum simply-bridge-0.24.1-linux-amd64.tar
+docker load -i simply-bridge-0.24.1-linux-amd64.tar
+docker run -d --rm --name simply-bridge-smoke simply-bridge:0.24.1
 docker exec simply-bridge-smoke node /app/deploy/healthcheck.mjs
 docker stop simply-bridge-smoke
 ```

@@ -44,6 +44,8 @@ test('import exposes one visible run action and active-job resume wiring',async(
  assert.match(dryRun,/>הפעל ייבוא</);assert.match(style,/#runWet\{display:none!important\}/);
  assert.match(dryRun,/runMode'\)\.value==='ask'&&dryComplete/);
  assert.match(index,/id="resumeActiveJob"/);assert.match(app,/activeOperation\(jobs,remembered\)/);assert.match(app,/operation-stages/);
+ assert.match(index,/id="activeRunsMenu"/);assert.match(index,/id="closeBackgroundJobs"/);assert.match(app,/toggleJobsPanel/);assert.match(app,/activeRunsBadge/);
+ assert.match(dryRun,/restoreDryRun/);assert.match(dryRun,/אין צורך בקובץ המקורי/);
 });
 
 test('admin repair UI groups causes and requires a documented exception close',async()=>{
