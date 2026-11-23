@@ -124,29 +124,27 @@ jobs:
           cp deploy/compose.yaml artifact/compose.yaml
           cp deploy/INSTALL-PODMAN-CMD.txt artifact/INSTALL-PODMAN-CMD.txt
           zip="simply-bridge-${APP_VERSION}-linux-amd64.zip"
-          (cd artifact && zip -0 -j "$zip" "$tar" "$tar.sha256" compose.yaml INSTALL-PODMAN-CMD.txt)
+          (cd artifact && zip -9 -j "$zip" "$tar" "$tar.sha256" compose.yaml INSTALL-PODMAN-CMD.txt)
           (cd artifact && sha256sum "$zip" > "$zip.sha256" && sha256sum --check "$zip.sha256")
-          sha="$(cut -d ' ' -f 1 "artifact/$tar.sha256")"
-          printf 'sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          tar_sha="$(cut -d ' ' -f 1 "artifact/$tar.sha256")"
+          zip_sha="$(cut -d ' ' -f 1 "artifact/$zip.sha256")"
+          printf 'tar_sha256=%s\nzip_sha256=%s\n' "$tar_sha" "$zip_sha" >> "$GITHUB_OUTPUT"
           {
             echo "## Simply Bridge ${APP_VERSION} Docker image"
             echo "- Commit: \`$GITHUB_SHA\`"
             echo '- Platform: \`linux/amd64\`'
             echo "- Node: \`v${NODE_VERSION}\`"
             echo "- TAR: \`$tar\`"
-            echo "- SHA256: \`$sha\`"
+            echo "- TAR SHA256: \`$tar_sha\`"
+            echo "- ZIP SHA256: \`$zip_sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
           name: simply-bridge-0.24.1-linux-amd64
           path: |
-            artifact/simply-bridge-0.24.1-linux-amd64.tar
-            artifact/simply-bridge-0.24.1-linux-amd64.tar.sha256
             artifact/simply-bridge-0.24.1-linux-amd64.zip
             artifact/simply-bridge-0.24.1-linux-amd64.zip.sha256
-            artifact/compose.yaml
-            artifact/INSTALL-PODMAN-CMD.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
