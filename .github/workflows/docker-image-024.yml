@@ -40,7 +40,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/release/0.24.0-build"
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(node -p "require('./package.json').version")" = "$APP_VERSION"
-          node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES (\"sqlite-ready\")'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
+          node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT)'); db.prepare('INSERT INTO probe VALUES (?)').run('sqlite-ready'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
           grep -F "ARG NODE_IMAGE=node:${NODE_VERSION}-bookworm-slim" Dockerfile
           grep -F '"node": ">=22.13.0"' package.json
           grep -F 'simply-bridge:0.24.0' deploy/compose.yaml docker-compose.yml
@@ -65,7 +65,7 @@ jobs:
           test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
           test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "$APP_VERSION"
           docker run --rm --entrypoint node "$IMAGE" -e "const assert=require('node:assert/strict'); assert.equal(process.version,'v${NODE_VERSION}'); assert.equal(require('/app/package.json').version,'${APP_VERSION}');"
-          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES (\"sqlite-ready\")'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
+          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE probe(value TEXT)'); db.prepare('INSERT INTO probe VALUES (?)').run('sqlite-ready'); if(db.prepare('SELECT value FROM probe').get().value!=='sqlite-ready') process.exit(1); db.close();"
           docker image inspect --format '{{json .Config.Volumes}}' "$IMAGE" | grep -F '"/app/data"'
 
       - name: Run regression suite with packaged Node runtime
