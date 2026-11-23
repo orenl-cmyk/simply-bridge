@@ -37,6 +37,54 @@ export function validateRelationRuleSets(raw){
  return new Map(Object.entries(raw));
 }
 
+export function validateImportRelationRules(raw,{mappings,schemas,allowMissingRelated=false}={}){
+ const bad=message=>{throw Object.assign(new Error(message),{status:422});};
+ if(!Array.isArray(raw))bad('כללי הקישור של הייבוא אינם תקינים.');
+ if(!Array.isArray(mappings)||!(schemas instanceof Map))bad('חסר הקשר לאימות כללי הקישור.');
+ let rules;
+ try{rules=validateRelationRuleSets({run:raw}).get('run');}
+ catch{bad('אחד מכללי הקישור חסר או אינו תקין.');}
+ const bySource=new Map();
+ for(const mapping of mappings){
+  const source=mapping?.sourceId||mapping?.entity?.meta?.dataName;
+  if(typeof source!=='string'||!source||typeof mapping.targetId!=='string')continue;
+  const current=bySource.get(source);
+  if(current&&current.targetId!==mapping.targetId)bad('ישות מקור אחת מופנית ליותר מישות יעד אחת.');
+  bySource.set(source,mapping);
+ }
+ const normalized=[];
+ for(const rule of rules){
+  const owner=bySource.get(rule.sourceEntity);
+  if(!owner)bad('כלל קישור מתייחס לישות מקור שאינה בחבילת הייבוא.');
+  const ownerSchema=schemas.get(owner.targetId),group=ownerSchema?.groups?.find(item=>item.id===rule.groupId),field=group?.fields?.find(item=>item.id===rule.fieldId);
+  if(!field||!['select-from-entity','multi-select-from-entity'].includes(field.type)||field.readonly||field.reference){
+   bad('כלל קישור מתייחס לשדה יעד שאינו שדה קישור תקין.');
+  }
+  if(!owner.relationStaging||typeof owner.relationStaging.groupId!=='string'||typeof owner.relationStaging.fieldId!=='string'){
+   bad('לישות המקור חסר שדה JSON לשמירת מעטפת הקישורים.');
+  }
+  const groupMappings=owner.mapping||[];
+  const mapped=groupMappings.some(item=>item.targetGroup===rule.groupId&&
+   (item.fields||[]).some(pair=>Array.isArray(pair.targetFields)?pair.targetFields.includes(rule.fieldId):pair.targetField===rule.fieldId))||
+   (!groupMappings.some(item=>item.targetGroup===rule.groupId)&&
+    (owner.sourceFields||[]).includes(JSON.stringify([rule.groupId,rule.fieldId])));
+  if(!mapped)bad('כלל קישור אינו תואם למיפוי שדות הייבוא.');
+  const targetSchema=schemas.get(rule.targetEntity);
+  if(!targetSchema)bad('מבנה ישות היעד של כלל הקישור אינו זמין בחיבור הנוכחי.');
+  try{checkKey(targetSchema,rule.targetKey);}catch{bad('מפתח החיפוש בכלל הקישור אינו מתאים לסכמת היעד.');}
+  const related=bySource.get(rule.sourceRelatedEntity);
+  if(related&&related.targetId!==rule.targetEntity)bad('ישות היעד של כלל הקישור אינה תואמת למיפוי הישות המקושרת.');
+  if(rule.valueMode==='packageKey'&&!related&&!allowMissingRelated)bad('חיפוש לפי מפתח החבילה מחייב לכלול את הישות המקושרת בייבוא.');
+  if(rule.onMissing!==undefined&&!['block','omit'].includes(rule.onMissing))bad('מדיניות החוסר בכלל הקישור אינה תקינה.');
+  if(rule.resolutions!==undefined&&(!rule.resolutions||typeof rule.resolutions!=='object'||Array.isArray(rule.resolutions)||
+   Object.entries(rule.resolutions).some(([value,id])=>!value||typeof id!=='string'||!id)))bad('בחירות התאמה ידניות בכלל הקישור אינן תקינות.');
+  normalized.push({sourceEntity:rule.sourceEntity,sourceRelatedEntity:rule.sourceRelatedEntity,targetEntity:rule.targetEntity,
+   groupId:rule.groupId,fieldId:rule.fieldId,valueMode:rule.valueMode,targetKey:structuredClone(rule.targetKey),
+   onMissing:rule.onMissing||'block',resolutions:structuredClone(rule.resolutions||{})});
+ }
+ return normalized;
+}
+
 export function createRelationFinalizer({connection,rules,identities,schemas,cache=new Map(),loadSchema=async entity=>normalizeStructure(await readOrigami(connection,'entity_structure',{entity_data_name:entity})),onCache=async()=>{},lookup=batchLookup,write=writeRelations}){
  const byField=new Map(rules.map(rule=>[key(rule.sourceEntity,rule.groupId,rule.fieldId),rule]));
 
@@ -65,6 +113,7 @@ export function createRelationFinalizer({connection,rules,identities,schemas,cac
    const rule=byField.get(key(source.entity,target.groupId,target.fieldId));
    try{
     const ids=new Set();
+    let omitted=false;
     for(const value of values){
      if(!rule)throw Error('חסרה הגדרת הצלבה לשדה הקישור.');
      const sourceId=relationId(value);
@@ -86,7 +135,7 @@ export function createRelationFinalizer({connection,rules,identities,schemas,cac
       cache.set(cacheKey,candidates);
      }
      const candidates=cache.get(cacheKey);
-     const chosen=choices?.[cacheKey];
+     const chosen=choices?.[cacheKey]||rule.resolutions?.[String(match)];
      if(candidates.length===1)ids.add(candidates[0]);
      else if(candidates.length>1&&candidates.includes(chosen))ids.add(chosen);
      else if(candidates.length>1){
@@ -94,9 +143,11 @@ export function createRelationFinalizer({connection,rules,identities,schemas,cac
        {matchKey:cacheKey,originalValue:match,options:candidates.slice(0,100)});
       throw Error('נדרשת בחירת רשומת יעד.');
      }
+     else if(rule.onMissing==='omit')omitted=true;
      else issue('not_found','לא נמצאה רשומת יעד לקישור.');
     }
-    fields.push({fieldId:target.fieldId,index,multi,value:multi?[...ids]:[...ids][0]??''});
+    const unresolved=issues.some(problem=>problem.fieldId===target.fieldId&&['not_found','ambiguous_match','needs_attention'].includes(problem.kind));
+    if((!unresolved&&!omitted)||multi&&ids.size)fields.push({fieldId:target.fieldId,index,multi,value:multi?[...ids]:[...ids][0]??''});
    }catch(error){if(!issues.some(problem=>problem.fieldId===target.fieldId&&problem.kind==='ambiguous_match'))issue('needs_attention',error.message);}
   }
   try{await write({connection,entity,id,fields,recover});}
