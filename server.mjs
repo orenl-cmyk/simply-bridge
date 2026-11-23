@@ -1,6 +1,6 @@
 import {createInterface} from 'node:readline';
 import {resolveBlackIssue,validateBlackConfig} from './black-issue-resolver.mjs';
-import {createRelationFinalizer,indexImportIdentities,validateRelationRuleSets} from './relation-finalizer.mjs';
+import {createRelationFinalizer,indexImportIdentities,validateImportRelationRules,validateRelationRuleSets} from './relation-finalizer.mjs';
 import {exportAll} from './export-pages.mjs';
 import {prepareImport,materializeDependencies,nodeKey} from './import-plan.mjs';
 import {fetchRelations,verifyRelations,checkKey} from './relations.mjs';
@@ -390,6 +390,84 @@ function queuedLink(record,staging){
  return {id:record.id,groupIndexes:indexes,envelope:JSON.stringify({relations:fields})};
 }
 
+function inspectRelationWork(batch,schema){
+ if(!batch.relationStaging)return {tasks:0,required:new Set()};
+ const mapped=applyImportMapping(batch.entity,schema,batch.mapping||[],batch.relationStaging,batch.targetId),required=new Set();let tasks=0;
+ for(const record of mapped.records){
+  const link=queuedLink(record,batch.relationStaging);if(!link)continue;tasks++;
+  const envelope=JSON.parse(link.envelope);
+  for(const relation of envelope.relations){
+   const value=relation.source.value,nonEmpty=Array.isArray(value)?value.length>0:value!==''&&value!==null&&value!==undefined;
+   if(nonEmpty)required.add(JSON.stringify([relation.source.entity,relation.target.groupId,relation.target.fieldId]));
+  }
+ }
+ return {tasks,required};
+}
+
+function relationMappingConfig(batch){
+ const sourceFields=new Set((batch.sourceFields||batch.entity?.meta?.fields||[]).map(field=>Array.isArray(field)?JSON.stringify(field):JSON.stringify([field.groupId,field.fieldId])));
+ for(const record of batch.entity?.records||[])for(const [groupId,rows] of Object.entries(record.data||{}))
+  for(const row of rows||[])for(const fieldId of Object.keys(row||{}))sourceFields.add(JSON.stringify([groupId,fieldId]));
+ return {sourceId:batch.entity.meta.dataName,targetId:batch.targetId,targetKey:batch.targetKey,
+  mapping:batch.mapping||[],relationStaging:batch.relationStaging||null,sourceFields:[...sourceFields].sort()};
+}
+
+function finalizeRulesForImport(connectionId,requested,mappings,schemas,required,{allowMissingRelated=false}={}){
+ const bySource=new Map();
+ for(const mapping of mappings){
+  const existing=bySource.get(mapping.sourceId);
+  if(existing){
+   const comparable=value=>{const {sourceFields,...rest}=value;return rest;};
+   if(JSON.stringify(comparable(existing))!==JSON.stringify(comparable(mapping)))throw fail(422,'המיפוי השתנה בין אצוות של אותה ישות. יש להפיק Preview מחדש.');
+   existing.sourceFields=[...new Set([...existing.sourceFields,...mapping.sourceFields])].sort();
+  }else bySource.set(mapping.sourceId,structuredClone(mapping));
+ }
+ const supplied=Array.isArray(requested)&&requested.length>0;
+ const legacy=(relationRules.get(connectionId)||[]).filter(rule=>bySource.has(rule.sourceEntity));
+ const rules=validateImportRelationRules(supplied?requested:legacy,{mappings:[...bySource.values()],schemas,allowMissingRelated});
+ const rulesByField=new Set(rules.map(rule=>JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId])));
+ for(const key of required)if(!rulesByField.has(key))throw fail(422,'חסר כלל קישור תקין עבור אחד משדות הקישור. בדקו את עורך הקישורים או את פריסט הייבוא.');
+ return rules;
+}
+
+function rulesForPreparation(connectionId,requested,mapping,schemas,required){
+ if(requested!==undefined&&!Array.isArray(requested))throw fail(422,'כללי הקישור של הייבוא אינם תקינים.');
+ const mappingConfig=relationMappingConfig(mapping),source= mappingConfig.sourceId,supplied=Array.isArray(requested)&&requested.length>0;
+ const candidates=supplied?requested.filter(rule=>rule?.sourceEntity===source):(relationRules.get(connectionId)||[]).filter(rule=>rule.sourceEntity===source);
+ let rules;
+ try{rules=validateImportRelationRules(candidates,{mappings:[mappingConfig],schemas,allowMissingRelated:true});}
+ catch(error){throw fail(422,error.message||'כללי הקישור אינם תואמים למיפוי ולסכמות.');}
+ const keys=new Set(rules.map(rule=>JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId])));
+ for(const key of required)if(!keys.has(key))throw fail(422,'חסר כלל קישור תקין עבור אחד משדות הקישור. בדקו את עורך הקישורים או את פריסט הייבוא.');
+ return rules;
+}
+
+function mergeRelationRuleSnapshots(snapshots){
+ const byKey=new Map();
+ for(const rules of snapshots){
+  if(!Array.isArray(rules))return undefined;
+  for(const rule of rules){
+   const key=JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId]),previous=byKey.get(key);
+   if(previous&&JSON.stringify(previous)!==JSON.stringify(rule))throw fail(409,'כללי הקישור השתנו בין אצוות ה־Preview. יש להפיק Preview חדש.');
+   byKey.set(key,structuredClone(rule));
+  }
+ }
+ return [...byKey.values()];
+}
+
+async function requiredRulesForPlans(plans,key){
+ const required=new Set();
+ for(const [planId,plan] of plans){
+  if(!plan.relationStaging)continue;
+  const rows=await relationPlanRows(planId,plan,key);
+  for(const [,row] of rows())for(const relation of JSON.parse(row.envelope||'{"relations":[]}').relations||[]){
+   const value=relation.source.value,nonEmpty=Array.isArray(value)?value.length>0:value!==''&&value!==null&&value!==undefined;
+   if(nonEmpty)required.add(JSON.stringify([relation.source.entity,relation.target.groupId,relation.target.fieldId]));
+  }
+ }
+ return required;
+}
+
 async function persistPreparedPlan(planId,plan,key,{includeLinks=true}={}){
  const work=[],links=[];
  for(const [index,planned] of plan.result.rows.entries()){
@@ -403,7 +481,9 @@ async function persistPreparedPlan(planId,plan,key,{includeLinks=true}={}){
    if(link)links.push([index,link]);
   }
  }
- const header={...plan,segmented:true,linkCount:links.length,mapping:undefined,entity:{meta:plan.entity.meta},sourceEntity:{meta:plan.sourceEntity.meta},
+ const sourceFields=new Set((plan.sourceEntity.meta.fields||[]).map(field=>JSON.stringify([field.groupId,field.fieldId])));
+ for(const record of plan.sourceEntity.records||[])for(const [groupId,rows] of Object.entries(record.data||{}))for(const row of rows||[])for(const fieldId of Object.keys(row||{}))sourceFields.add(JSON.stringify([groupId,fieldId]));
+ const header={...plan,segmented:true,linkCount:links.length,sourceFields:[...sourceFields].sort(),mapping:undefined,entity:{meta:plan.entity.meta},sourceEntity:{meta:plan.sourceEntity.meta},
   result:{...plan.result,mapping:undefined,rows:plan.result.rows.map(row=>({
    sourceId:row.sourceId,matchKey:row.matchKey,targetId:row.targetId,status:row.status,
    requestCount:row.requests?.length||1
@@ -412,12 +492,12 @@ async function persistPreparedPlan(planId,plan,key,{includeLinks=true}={}){
  runtimePlans.set(planId,header);
 }
 
-async function buildImportPreparation({s,c,b,guard,onDebug,onProgress,includeLinks=false}){
+async function buildImportPreparation({s,c,b,guard,onDebug,onProgress,includeLinks=false,finalizerRules=[]}){
  const schemas=s.schemas.get(c.id+':'+c.updatedAt)||new Map();
  const prepared=await prepareImport({connection:c,mappings:b.mappings,rules:b.rules??[],schemas,guard,onDebug,onProgress});guard();
  const ids=prepared.plans.map(()=>randomUUID()),batch={nodes:new Map(),halted:false},createdAt=Date.now();
  prepared.order.forEach(item=>batch.nodes.set(item.key,{planId:ids[item.planIndex],index:item.index,dependencies:item.dependencies}));
- for(let i=0;i<prepared.plans.length;i++){const p=prepared.plans[i],plan={ownerId:s.userId,connectionId:c.id,connectionVersion:c.updatedAt,createdAt,sourceEntity:structuredClone(p.entity),entity:p.mapped,targetId:p.targetId,targetKey:p.targetKey,mapping:p.mapping,relationStaging:p.relationStaging,schema:p.schema,result:p.result,relationData:p.relationData,halted:false,batch};await persistPreparedPlan(ids[i],plan,s.key,{includeLinks});}
+ for(let i=0;i<prepared.plans.length;i++){const p=prepared.plans[i],sourceId=p.entity.meta.dataName,plan={ownerId:s.userId,connectionId:c.id,connectionVersion:c.updatedAt,createdAt,sourceEntity:structuredClone(p.entity),entity:p.mapped,targetId:p.targetId,targetKey:p.targetKey,mapping:p.mapping,relationStaging:p.relationStaging,schema:p.schema,result:p.result,relationData:p.relationData,finalizerRules:structuredClone(finalizerRules.filter(rule=>rule.sourceEntity===sourceId)),halted:false,batch};await persistPreparedPlan(ids[i],plan,s.key,{includeLinks});}
  return {plans:prepared.plans.map((p,i)=>({id:ids[i],result:p.result,sourceEntity:p.entity,targetKey:p.targetKey,mapping:p.mapping,relationStaging:p.relationStaging})),order:prepared.order.map(item=>({...item,planId:ids[item.planIndex]})),report:prepared.report};
 }
 function dryReport(prepared){
@@ -448,7 +528,7 @@ async function runDryPreparation(jobId,job,session,connection){
  const worker={...session,key:Buffer.from(session.key),schemas:new Map([[connection.id+':'+connection.updatedAt,new Map(input.schemas)]])};
  job.workerActive=true;
  try{
-  const prepared=await buildImportPreparation({s:worker,c:connection,b:input.request,guard:()=>{},
+  const prepared=await buildImportPreparation({s:worker,c:connection,b:input.request,guard:()=>{},includeLinks:Boolean(input.relationTaskCount),finalizerRules:input.finalizerRules||[],
    onDebug:debug=>{job.debug=debug;},onProgress:progress=>{
     const quota=rateSnapshot(connection);
     const remaining=Math.max(0,Number(progress.totalRecords||job.batchRecords||0)-Number(progress.records||0));
@@ -659,7 +739,24 @@ async function runBackgroundImport(jobId,s,{finalize=true}={}){
    });
    const done=(job.baseProgress.completed||0)+completed.size,elapsed=Math.max(1,(Date.now()-startedAt)/1000),remaining=Math.max(0,job.progress.total-done),observed=done?Math.ceil(remaining/(done/elapsed)):0;job.rateLimit=rateSnapshot(connection);job.progress={...job.progress,completed:done,percent:job.progress.total?Math.floor(done*100/job.progress.total):100,etaSeconds:Math.max(observed,rateEtaSeconds(job.rateLimit,Math.max(remaining,job.progress.apiRequestsTotal-(job.progress.apiRequestsCompleted+apiRequests)))),apiRequestsCompleted:job.progress.apiRequestsCompleted+apiRequests,lastProgressAt:Date.now()};checkpoint++;if(checkpoint>=100){checkpoint=0;await storeJob(jobId,job,worker.key);}
   }};
- try{const concurrency=Math.min(Math.max(1,job.progress.total-(job.baseProgress.completed||0)-completed.size),connection.maxConcurrentRequests||3);await Promise.all(Array.from({length:concurrency},workerLoop));removeFinishedWrites(job);if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};if(finalize&&job.state!=='paused')job.finishedAt=Date.now();await storeJob(jobId,job,worker.key);}catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
+ try{
+  const concurrency=Math.min(Math.max(1,job.progress.total-(job.baseProgress.completed||0)-completed.size),connection.maxConcurrentRequests||3);
+  await Promise.all(Array.from({length:concurrency},workerLoop));
+  removeFinishedWrites(job);
+  if(finalize&&job.manualFinalizer&&job.state==='running'&&!job.stopRequested){
+   const input=runtimeInputs.get(job.inputId);if(!input)throw Error('Snapshot כללי הקישור של הייבוא אינו זמין.');
+   const relations=await pipelineRelationWorker(jobId,job,worker,input);
+   for(let index=0;index<job.planIds.length;index++)await relations.register(index);
+   await relations.drain();
+   job.relationState=(job.relationIssues||[]).length?'completed_with_gaps':'completed';
+   job.progress.relationCompleted=job.relationCompleted||0;
+   if(job.relationState==='completed_with_gaps')job.state='completed_with_gaps';
+  }
+  if(finalize&&job.state==='running')job.state=job.stopRequested?'stopped':'done';
+  if(finalize&&job.state==='done')job.progress={...job.progress,percent:100,etaSeconds:0};
+  if(finalize&&job.state!=='paused')job.finishedAt=Date.now();
+  await storeJob(jobId,job,worker.key);
+ }catch(e){job.state='paused';job.pauseKind='system';job.pauseReason=e.message||'הריצה הושהתה עקב תקלה פנימית.';await storeJob(jobId,job,worker.key);}finally{job.workerActive=false;worker.key.fill(0);}
 }
 const activeRowRepairs=new Set();
 const stalledRowRepairs=new Set(),rowRepairSessions=new Map();
@@ -1031,11 +1128,12 @@ function retireCleanBatch(job,planId){
 
 async function runImportPipeline(jobId,s){
  const job=backgroundJobs.get(jobId),input=job&&runtimeInputs.get(job.inputId);if(!job||!input||job.pipelineWorkerActive)return;job.pipelineWorkerActive=true;const worker={...s,key:Buffer.from(s.key),data:structuredClone(s.data),schemas:new Map(s.schemas)};worker.schemas.set(job.connectionId+':'+job.connectionVersion,new Map(input.schemas||[]));try{
-  const relations=input.finalizerRules?await pipelineRelationWorker(jobId,job,worker,input):null;
+  const relations=job.relationBatchPlans?await pipelineRelationWorker(jobId,job,worker,input):null;
   if(relations){
    for(let index=0;index<job.nextBatch;index++)await relations.register(index);
    await relations.drain();
    await relations.prune();
+   job.relationState=(job.relationIssues||[]).length?'completed_with_gaps':'completed';
   }
   while(job.nextBatch<input.batches.length&&job.state==='running'&&!job.stopRequested){
    const connection=worker.data.connections.find(c=>c.id===job.connectionId);if(!connection)throw Error('חיבור היעד אינו זמין.');
@@ -1066,8 +1164,12 @@ job.progress.phase='checking';job.progress.activeBatch=job.nextBatch+1;await sto
    if(job.retiredPlan)await deleteRetiredPlan(job,worker.key);
    await relations?.drain();
    await relations?.prune();
+   if(relations)job.relationState=(job.relationIssues||[]).length?'completed_with_gaps':
+    job.relationCompleted>=job.progress.relationsTotal?'completed':'pending';
   }
-  if(job.state==='running'){job.state=job.stopRequested?'stopped':hasImportGaps(job)?'completed_with_gaps':'done';job.progress={...job.progress,phase:'complete',percent:100,etaSeconds:0};job.finishedAt=Date.now();}await storeJob(jobId,job,worker.key);
+  if(job.state==='running'){job.state=job.stopRequested?'stopped':hasImportGaps(job)?'completed_with_gaps':'done';job.progress={...job.progress,phase:'complete',percent:100,etaSeconds:0};job.finishedAt=Date.now();}
+  if(!job.relationBatchPlans)job.relationState='not_required';
+  await storeJob(jobId,job,worker.key);
   if(job.state==='done'&&!job.pendingRelationRepair&&!relationRepairWorkers.has(jobId)){
    try{await cleanupSuccessfulPipeline(jobId,job,worker.key);}
    catch{console.error('Completed job cleanup interrupted',jobId);}
@@ -1281,7 +1383,8 @@ async function api(req,res,url){
   const items=[...new Map(matching.map(issue=>[issue.cursor,issue])).values()];
   if(!items.length)throw fail(404,'קבוצת החריגים או רשומת היעד לא נמצאו.');
   const keyOf=rule=>JSON.stringify([rule.sourceEntity,rule.groupId,rule.fieldId]);
-  const rulesByKey=new Map((relationRules.get(job.connectionId)||input.finalizerRules).map(rule=>[keyOf(rule),rule]));
+  const retryRuleSnapshot=Array.isArray(input.finalizerRules)?input.finalizerRules:(relationRules.get(job.connectionId)||[]);
+  const rulesByKey=new Map(retryRuleSnapshot.map(rule=>[keyOf(rule),rule]));
   for(const rule of Object.values(job.relationRuleOverrides||{}))rulesByKey.set(keyOf(rule),rule);
   let mappingOverride;
   if(mapping!==undefined){
@@ -1734,8 +1837,16 @@ async function api(req,res,url){
  }
  if(url==='/api/import/prepare/start'&&method==='POST'){
   const b=await bodyOf(req),c=s.data.connections.find(c=>c.id===b.connectionId);if(!c||s.data.activeId!==c.id)throw fail(409,'בחרו חיבור יעד פעיל.');if(b.schemaVersion!=='1.0')throw fail(422,'גרסת חבילה לא נתמכת.');
+  const schemas=s.schemas.get(c.id+':'+c.updatedAt)||new Map();if(!Array.isArray(b.mappings)||!b.mappings.length)throw fail(422,'לא נמצאו מיפויי ייבוא.');
+  let finalizerRules=[],relationTaskCount=0;
+  for(const mapping of b.mappings){
+   const schema=schemas.get(mapping.targetId);if(!schema)throw fail(422,'מבנה ישות היעד אינו זמין.');
+   const inspected=inspectRelationWork(mapping,schema);relationTaskCount+=inspected.tasks;
+   finalizerRules.push(...rulesForPreparation(c.id,b.relationRules,mapping,schemas,inspected.required));
+  }
+  finalizerRules=mergeRelationRuleSnapshots([finalizerRules])||[];
   const jobId=randomUUID(),inputId='dry-input-'+jobId,job={type:'import_prepare',inputId,ownerId:s.userId,username:s.username,connectionName:c.name,transferId:typeof b.transferId==='string'?b.transferId:null,label:b.label||b.fileName||'Dry Run',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,batchIndex:Number(b.batchIndex)||0,batchCount:Math.max(1,Number(b.batchCount)||1),batchRecords:Math.max(0,Number(b.batchRecords)||0),totalRecords:Math.max(0,Number(b.totalRecords)||0),state:'running',connectionId:c.id,connectionVersion:c.updatedAt,createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,debug:null,rateLimit:rateSnapshot(c),progress:{phase:'starting',entityIndex:0,entities:Array.isArray(b.mappings)?b.mappings.length:0,records:0,etaSeconds:null}};
-  const input={request:b,schemas:[...(s.schemas.get(c.id+':'+c.updatedAt)||new Map())]};
+  const request={...b,relationRules:finalizerRules};const input={request,finalizerRules,relationTaskCount,schemas:[...schemas]};
   await saveDurablePayload(directory,s.key,inputId,input);
   await startDurableImport(jobId,job,s);
   runtimeInputs.set(inputId,input);
@@ -1744,13 +1855,16 @@ async function api(req,res,url){
  }
  if(url==='/api/import/prepare'&&method==='POST'){
   const b=await bodyOf(req),c=s.data.connections.find(c=>c.id===b.connectionId);if(!c||s.data.activeId!==c.id)throw fail(409,'בחרו חיבור יעד פעיל.');if(b.schemaVersion!=='1.0')throw fail(422,'גרסת חבילה לא נתמכת.');
+  const schemas=s.schemas.get(c.id+':'+c.updatedAt)||new Map();if(!Array.isArray(b.mappings)||!b.mappings.length)throw fail(422,'לא נמצאו מיפויי ייבוא.');let finalizerRules=[],relationTaskCount=0;
+  for(const mapping of b.mappings){const schema=schemas.get(mapping.targetId);if(!schema)throw fail(422,'מבנה ישות היעד אינו זמין.');const inspected=inspectRelationWork(mapping,schema);relationTaskCount+=inspected.tasks;finalizerRules.push(...rulesForPreparation(c.id,b.relationRules,mapping,schemas,inspected.required));}
+  finalizerRules=mergeRelationRuleSnapshots([finalizerRules])||[];
   const guard=()=>{if(auth(req)!==s||s.data.activeId!==c.id||s.data.connections.find(x=>x.id===c.id)?.updatedAt!==c.updatedAt)throw fail(409,'החיבור השתנה במהלך ה־Dry Run.');};
-  let debug;try{return send(res,200,{...await buildImportPreparation({s,c,b,guard,onDebug:d=>debug=d}),debug,expiresAt:s.last+ttl});}catch(e){if(debug)e.debug=debug;throw e;}
+  let debug;try{return send(res,200,{...await buildImportPreparation({s,c,b,guard,onDebug:d=>debug=d,includeLinks:Boolean(relationTaskCount),finalizerRules}),debug,expiresAt:s.last+ttl});}catch(e){if(debug)e.debug=debug;throw e;}
  }
  if(url==='/api/import/fetch-relations'&&method==='POST'){
   const b=await bodyOf(req),c=s.data.connections.find(c=>c.id===b.connectionId);if(!c||s.data.activeId!==c.id)throw fail(409,'בחרו חיבור יעד פעיל.');
   const schemas=s.schemas.get(c.id+':'+c.updatedAt)||new Map(),guard=()=>{if(auth(req)!==s||s.data.activeId!==c.id||s.data.connections.find(x=>x.id===c.id)?.updatedAt!==c.updatedAt)throw fail(409,'החיבור השתנה.');};
-  let debug;try{const result=await fetchRelations({connection:c,mappings:b.mappings,rules:b.rules,schemas,guard,onDebug:d=>debug=d});guard();s.relations??=new Map();const token=randomUUID();s.relations.set(token,{connectionId:c.id,connectionVersion:c.updatedAt,createdAt:Date.now(),entries:result.entries});return send(res,200,{token,report:result.report,debug,expiresAt:s.last+ttl});}catch(e){if(debug)e.debug=debug;throw e;}
+  let debug;try{const configs=(b.mappings||[]).map(relationMappingConfig),rules=validateImportRelationRules(b.rules,{mappings:configs,schemas});const result=await fetchRelations({connection:c,mappings:b.mappings,rules,schemas,guard,onDebug:d=>debug=d});guard();s.relations??=new Map();const token=randomUUID();s.relations.set(token,{connectionId:c.id,connectionVersion:c.updatedAt,createdAt:Date.now(),entries:result.entries,rules:structuredClone(rules)});return send(res,200,{token,report:result.report,debug,expiresAt:s.last+ttl});}catch(e){if(debug)e.debug=debug;throw e;}
  }
  if(url==='/api/import/dry-run'&&method==='POST'){
   const b=await bodyOf(req),c=s.data.connections.find(x=>x.id===b.connectionId);
@@ -1779,36 +1893,70 @@ async function api(req,res,url){
    }
    const schemas=s.schemas.get(connection.id+':'+connection.updatedAt);
    if(!schemas?.size)throw fail(422,'יש לטעון את מבנה ישות היעד לפני הפעלת הייבוא.');
-   input={schemaVersion:b.schemaVersion,batches:[],rules:b.rules||[],finalizerRules:relationRules.get(connection.id),schemas:[...schemas]};
-   let checkTotal=0;
+   input={schemaVersion:b.schemaVersion,batches:[],rules:b.rules||[],finalizerRules:[],schemas:[...schemas]};
+   if(b.relationRules!==undefined&&!Array.isArray(b.relationRules))throw fail(422,'כללי הקישור של הייבוא אינם תקינים.');
+   let checkTotal=0,relationTaskCount=0;const requiredRelationRules=new Set(),mappingConfigs=new Map();
    for await(const batch of batches){
     const records=batch?.entity?.records;
     if(!Array.isArray(records)||typeof batch.entity.meta?.dataName!=='string'||!schemas.has(batch.targetId)){
      throw fail(422,'אצוות ייבוא לא תקינה.');
     }
+    const sourceId=batch.entity.meta.dataName,sourceFields=new Set((batch.entity.meta.fields||[]).map(field=>JSON.stringify([field.groupId,field.fieldId])));
+    for(const record of records)for(const [groupId,rows] of Object.entries(record.data||{}))
+     for(const row of rows||[])for(const fieldId of Object.keys(row||{}))sourceFields.add(JSON.stringify([groupId,fieldId]));
+    const config={sourceId,targetId:batch.targetId,targetKey:batch.targetKey,mapping:batch.mapping||[],
+     relationStaging:batch.relationStaging||null,sourceFields:[...sourceFields].sort()};
+    const oldConfig=mappingConfigs.get(sourceId);
+    if(oldConfig){
+     const comparable=({sourceFields,...value})=>value;
+     if(JSON.stringify(comparable(oldConfig))!==JSON.stringify(comparable(config)))throw fail(422,'המיפוי השתנה בין אצוות של אותה ישות. יש להפיק Preview מחדש.');
+     config.sourceFields=[...new Set([...oldConfig.sourceFields,...config.sourceFields])].sort();
+    }
+    mappingConfigs.set(sourceId,config);
+    const inspected=inspectRelationWork(batch,schemas.get(batch.targetId));
+    relationTaskCount+=inspected.tasks;for(const key of inspected.required)requiredRelationRules.add(key);
     await saveImportBatch(directory,s.key,inputId,input.batches.length,batch);
     input.batches.push({entity:{meta:{dataName:batch.entity.meta.dataName}},targetId:batch.targetId,
      relationStaging:Boolean(batch.relationStaging),recordCount:records.length});
     checkTotal+=records.length;
    }
    if(!req.complete||!checkTotal)throw fail(422,'לא התקבלה חבילת ייבוא שלמה.');
+   const mappings=[...mappingConfigs.values()];
+   input.finalizerRules=finalizeRulesForImport(connection.id,b.relationRules,mappings,schemas,requiredRelationRules);
+   input.relationTaskCount=relationTaskCount;
    const baseProgress={phase:'starting',checked:0,checkTotal,completed:0,total:0,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:0};
    const baseCounts={input:0,planned:0,skipped:0,blocked:0,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0};
-   job={type:'import_run',pipeline:true,segmentedInput:true,compactBatches:true,relationBatchPlans:input.finalizerRules?{}:undefined,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};
+   baseProgress.relationsTotal=relationTaskCount;
+   job={type:'import_run',pipeline:true,segmentedInput:true,compactBatches:true,relationBatchPlans:relationTaskCount?{}:undefined,inputId,ownerId:s.userId,username:s.username,connectionName:connection.name,connectionId:connection.id,connectionVersion:connection.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,nextBatch:0,checkedBeforeBatch:0,planIds:[],order:[],completedKeys:[],relationCompleted:0,relationState:relationTaskCount?'pending':'not_required',baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};
    await clearImportKeys(directory,s.key,inputId);
    await saveDurablePayload(directory,s.key,inputId,input);
    await startDurableImport(jobId,job,s);
-  }catch(error){await deleteDurablePayload(directory,inputId);throw error;}
+  }catch(error){for(let index=0;index<(input?.batches?.length||0);index++)await deleteImportBatch(directory,inputId,index).catch(()=>{});await deleteDurablePayload(directory,inputId);throw error;}
   finally{await batches.return?.();}
   runtimeInputs.set(inputId,input);void runImportPipeline(jobId,s);return send(res,202,{jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/status'&&method==='POST'){
-  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,outcome:importOutcome(job),progress:job.pipeline?reportPipelineProgress(job,job.pipelineWorkerActive):job.progress,rateLimit:job.rateLimit,counts:job.counts,relationCompleted:job.relationCompleted,relationIssueCount:job.relationIssues?.length||0,retryAt:Math.min(...Object.entries(job.retries||{}).filter(([key])=>runtimeOutcomes.get(key)?.status==='deferred').map(([,retry])=>retry.nextAt)),rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
+  const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');return send(res,200,{state:job.state,outcome:importOutcome(job),progress:job.pipeline?reportPipelineProgress(job,job.pipelineWorkerActive):job.progress,rateLimit:job.rateLimit,counts:job.counts,relationState:job.relationState,relationCompleted:job.relationCompleted,relationIssueCount:job.relationIssues?.length||0,retryAt:Math.min(...Object.entries(job.retries||{}).filter(([key])=>runtimeOutcomes.get(key)?.status==='deferred').map(([,retry])=>retry.nextAt)),rows:job.rows.slice(-500),truncated:job.rows.length>500,error:job.error,pauseKind:job.pauseKind,pauseReason:job.pauseReason,startedAt:job.startedAt,finishedAt:job.finishedAt,expiresAt:s.last+ttl});
  }
  if(url==='/api/import/run/stop'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');job.stopRequested=true;await storeJob(b.jobId,job,s.key);return send(res,200,{ok:true,expiresAt:s.last+ttl});}
  if(url==='/api/import/run/resume'&&method==='POST'){const b=await bodyOf(req),job=backgroundJobs.get(b.jobId);if(!job||job.type!=='import_run'||job.ownerId!==s.userId)throw fail(404,'משימת הייבוא לא נמצאה.');if(job.connectionId!==s.data.activeId)throw fail(409,'בחרו את החיבור ששימש לריצה לפני ההמשך.');if(!['paused','stopped','error'].includes(job.state))throw fail(409,'הריצה אינה מושהית.');job.state='running';job.finishedAt=null;job.stopRequested=false;await startDurableImport(b.jobId,job,s);if(job.pipeline)void runImportPipeline(b.jobId,s);else void runBackgroundImport(b.jobId,s);return send(res,202,{jobId:b.jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});}
  if(url==='/api/import/run/start'&&method==='POST'){
   const b=await bodyOf(req);if([...backgroundJobs.values()].some(job=>job.type==='import_run'&&job.ownerId===s.userId&&job.connectionId===s.data.activeId&&job.state==='running'))throw fail(409,'כבר פועל ייבוא ברקע בחיבור הזה. התקדמותו מוצגת ברשימת התהליכים.');if(!Array.isArray(b.planIds)||!b.planIds.length||!Array.isArray(b.order))throw fail(422,'לא נמצאה תוכנית כתיבה קפואה. בצעו Dry Run חדש.');const selected=b.planIds.map(id=>runtimePlans.get(id));if(selected.some(p=>!p||p.ownerId!==s.userId||p.connectionId!==s.data.activeId))throw fail(409,'תוכנית הייבוא אינה שייכת לחיבור הפעיל.');
+  const connection=s.data.connections.find(c=>c.id===s.data.activeId),schemas=s.schemas.get(connection.id+':'+connection.updatedAt)||new Map();
+  const snapshots=selected.map(plan=>plan.finalizerRules),hasSnapshots=snapshots.every(Array.isArray);
+  if(snapshots.some(Array.isArray)&&!hasSnapshots)throw fail(409,'חלק מתוכניות ה־Preview ישנות ואינן כוללות Snapshot של כללי הקישור. יש להפיק Preview חדש.');
+  const requestedRules=hasSnapshots?mergeRelationRuleSnapshots(snapshots):undefined;
+  const relationMappings=[];
+  for(let index=0;index<selected.length;index++){
+   const plan=selected[index],mapping=plan.segmented?await loadPlanMapping(directory,s.key,b.planIds[index]):plan.mapping||[];
+   relationMappings.push({sourceId:plan.sourceEntity.meta.dataName,targetId:plan.targetId,targetKey:plan.targetKey,mapping,
+    relationStaging:plan.relationStaging||null,sourceFields:plan.sourceFields||[],entity:{meta:plan.sourceEntity.meta},
+    linkCount:plan.linkCount??0,segmented:plan.segmented});
+  }
+  const required=await requiredRulesForPlans(b.planIds.map((id,index)=>[id,selected[index]]),s.key);
+  const finalizerRules=finalizeRulesForImport(connection.id,requestedRules,relationMappings,schemas,required);
+  const relationTaskCount=relationMappings.reduce((sum,mapping)=>sum+Number(mapping.linkCount||0),0),inputId='manual-input-'+randomUUID();
+  const finalizerInput={schemaVersion:'1.0',finalizerRules,relationTaskCount,schemas:[...schemas],batches:relationMappings.map(mapping=>({entity:{meta:{dataName:mapping.sourceId}},targetId:mapping.targetId,relationStaging:Boolean(mapping.relationStaging),recordCount:mapping.linkCount}))};
   const observed=new Set();
   for(const plan of selected)for(const row of plan.result.rows){
    const key=JSON.stringify([plan.targetId,plan.targetKey,String(row.matchKey)]);
@@ -1817,10 +1965,7 @@ async function api(req,res,url){
   }
   const planSet=new Set(b.planIds),expected=new Set();for(const planId of b.planIds){const plan=runtimePlans.get(planId);for(let index=0;index<plan.result.rows.length;index++)if(plan.result.rows[index].status==='planned')expected.add(planId+':'+index);}
   const order=b.order.map(item=>({planId:item?.planId,index:Number(item?.index)})),seen=new Set();for(const item of order){const key=item.planId+':'+item.index;if(!planSet.has(item.planId)||!Number.isInteger(item.index)||!expected.has(key)||seen.has(key))throw fail(422,'סדר הכתיבה אינו תואם ל־Dry Run. בצעו בדיקה חדשה.');seen.add(key);}if(seen.size!==expected.size)throw fail(422,'סדר הכתיבה חסר רשומות שאושרו ב־Dry Run.');
-  for(const [index,plan] of selected.entries()){
-   if(!plan.segmented)await persistPreparedPlan(b.planIds[index],plan,s.key,{includeLinks:false});
-  }
-  const connection=s.data.connections.find(c=>c.id===s.data.activeId),allRows=selected.flatMap(p=>p.result.rows),requestTotal=order.reduce((sum,item)=>sum+(runtimePlans.get(item.planId).result.rows[item.index].requestCount||runtimePlans.get(item.planId).result.rows[item.index].requests?.length||1),0),jobId=randomUUID(),baseProgress={completed:0,total:order.length,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:requestTotal},baseCounts={input:allRows.length,planned:order.length,skipped:allRows.filter(r=>r.status==='skipped').length,blocked:allRows.filter(r=>r.status==='blocked').length,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0},job={type:'import_run',ownerId:s.userId,username:s.username,connectionName:connection?.name||'',connectionId:s.data.activeId,connectionVersion:connection?.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,order:structuredClone(order),completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};await startDurableImport(jobId,job,s);
+  const allRows=selected.flatMap(p=>p.result.rows),requestTotal=order.reduce((sum,item)=>sum+(runtimePlans.get(item.planId).result.rows[item.index].requestCount||runtimePlans.get(item.planId).result.rows[item.index].requests?.length||1),0),jobId=randomUUID(),baseProgress={completed:0,total:order.length,percent:0,etaSeconds:null,apiRequestsCompleted:0,apiRequestsTotal:requestTotal,relationsTotal:relationTaskCount},baseCounts={input:allRows.length,planned:order.length,skipped:allRows.filter(r=>r.status==='skipped').length,blocked:allRows.filter(r=>r.status==='blocked').length,succeeded:0,failed:0,not_sent:0,unknown:0,stopped:0},job={type:'import_run',manualFinalizer:relationTaskCount>0,inputId:relationTaskCount?inputId:undefined,finalizerRules:structuredClone(finalizerRules),planIds:structuredClone(b.planIds),relationCompleted:0,relationState:relationTaskCount?'pending':'not_required',ownerId:s.userId,username:s.username,connectionName:connection?.name||'',connectionId:s.data.activeId,connectionVersion:connection?.updatedAt,label:b.label||b.fileName||'ייבוא',fileName:b.fileName||'',fileSize:Number(b.fileSize)||0,state:'running',createdAt:Date.now(),startedAt:new Date().toISOString(),finishedAt:null,stopRequested:false,order:structuredClone(order),completedKeys:[],baseProgress,progress:structuredClone(baseProgress),baseCounts,counts:structuredClone(baseCounts),rows:[],rateLimit:rateSnapshot(connection)};if(relationTaskCount){await saveDurablePayload(directory,s.key,inputId,finalizerInput);runtimeInputs.set(inputId,finalizerInput);}await startDurableImport(jobId,job,s);
   void runBackgroundImport(jobId,s);
   return send(res,202,{jobId,state:'running',progress:job.progress,expiresAt:s.last+ttl});
  }

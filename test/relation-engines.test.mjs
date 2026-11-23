@@ -45,6 +45,22 @@ test('relation target searches include archived records',async()=>{
  assert.equal(request.with_archive,1);
 });
 
+test('a missing single-relation target is reported without clearing the existing field',async()=>{
+ let written;
+ const finalize=createRelationFinalizer({connection:{},rules:[{sourceEntity:'source',sourceRelatedEntity:'linked',targetEntity:'linked-target',groupId:'g',fieldId:'link',targetKey:{kind:'field',groupId:'g',fieldId:'external'},valueMode:'sourceText'}],identities:new Map(),schemas:new Map([['linked-target',{groups:[{id:'g',fields:[{id:'external',type:'input-text'}]}]}]]),lookup:async()=>new Map([['missing',[]]]),write:async({fields})=>{written=fields;}});
+ const issues=await finalize({entity:'target',id:'record',schema:{groups:[{id:'g',fields:[{id:'link',type:'select-from-entity'}]}]},envelope:{relations:[{source:{entity:'source',value:{instance_id:'not-in-package',text:'missing'}},target:{groupId:'g',fieldId:'link'}}]}});
+ assert.ok(issues.some(issue=>issue.kind==='not_found'));
+ assert.deepEqual(written,[]);
+});
+
+test('an explicitly omitted missing relation is not written or reported as a false success',async()=>{
+ let written;
+ const finalize=createRelationFinalizer({connection:{},rules:[{sourceEntity:'source',sourceRelatedEntity:'linked',targetEntity:'linked-target',groupId:'g',fieldId:'link',targetKey:{kind:'field',groupId:'g',fieldId:'external'},valueMode:'sourceText',onMissing:'omit'}],identities:new Map(),schemas:new Map([['linked-target',{groups:[{id:'g',fields:[{id:'external',type:'input-text'}]}]}]]),lookup:async()=>new Map([['missing',[]]]),write:async({fields})=>{written=fields;}});
+ const issues=await finalize({entity:'target',id:'record',schema:{groups:[{id:'g',fields:[{id:'link',type:'select-from-entity'}]}]},envelope:{relations:[{source:{entity:'source',value:{instance_id:'not-in-package',text:'missing'}},target:{groupId:'g',fieldId:'link'}}]}});
+ assert.deepEqual(issues,[]);
+ assert.deepEqual(written,[]);
+});
+
 test('HTTP 200 Origami API errors preserve the existing relation field',async t=>{
  const server=http.createServer((_request,response)=>{
   response.writeHead(200,{'content-type':'application/json'});
