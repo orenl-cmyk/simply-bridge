@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {applyImportMapping} from './public/import-mapping.js';
+import {validateImportRelationRules} from './relation-finalizer.mjs';
 export function validateImportPreset(b,connectionId,schemas,current){
  const bad=m=>{throw Object.assign(new Error(m),{status:422});};
  if(typeof b.name!=='string'||!b.name.trim()||b.name.trim().length>80)bad('שם פריסט נדרש, עד 80 תווים.');
@@ -15,5 +16,8 @@ export function validateImportPreset(b,connectionId,schemas,current){
   const relationStaging=r.relationStaging?{groupId:r.relationStaging.groupId,fieldId:r.relationStaging.fieldId}:null;applyImportMapping(fake,schema,mapping,relationStaging,r.targetId);
   return {sourceId:r.sourceId,targetId:r.targetId,targetKey:k.kind==='recordId'?{kind:'recordId'}:{kind:'field',groupId:k.groupId,fieldId:k.fieldId},mapping,relationStaging};
  });
- return {relations:[],id:current?.id||randomUUID(),connectionId,sourceScope:b.sourceScope,name:b.name.trim(),rules,updatedAt:new Date().toISOString()};
+ let relations;
+ try{relations=validateImportRelationRules(b.relations??[],{mappings:rules,schemas});}
+ catch(error){bad(error.message||'כללי הקישור בפריסט אינם תקינים.');}
+ return {relations,id:current?.id||randomUUID(),connectionId,sourceScope:b.sourceScope,name:b.name.trim(),rules,updatedAt:new Date().toISOString()};
 }
