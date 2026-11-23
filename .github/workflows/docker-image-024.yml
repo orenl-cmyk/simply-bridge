@@ -120,6 +120,9 @@ jobs:
           assert len(manifest) == 1, f'Expected one image, found {len(manifest)}'
           assert set(manifest[0]['RepoTags']) == {f'simply-bridge:{sys.argv[2]}', 'simply-bridge:current'}
           PY
+          docker image load --input "artifact/$tar"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "$APP_VERSION"
           (cd artifact && sha256sum "$tar" > "$tar.sha256" && sha256sum --check "$tar.sha256")
           cp deploy/compose.yaml artifact/compose.yaml
           cp deploy/INSTALL-PODMAN-CMD.txt artifact/INSTALL-PODMAN-CMD.txt
