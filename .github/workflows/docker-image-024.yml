@@ -46,7 +46,9 @@ jobs:
           grep -F 'simply-bridge:0.24.0' deploy/compose.yaml docker-compose.yml
 
       - name: Run source regression suite
-        run: npm test
+        run: |
+          sudo install -d -m 1777 /work
+          npm test
 
       - uses: docker/setup-buildx-action@v3
 
